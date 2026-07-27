@@ -1,0 +1,14 @@
+# Secrets must never enter image layers — inject at runtime
+.env
+.env.*
+!.env.example
+
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+tests/
+.DS_Store
