@@ -4,7 +4,7 @@ from typing import Any
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
 from pydantic import BaseModel
-from sqlalchemy import ColumnElement, delete, func, or_, select
+from sqlalchemy import ColumnElement, Float, delete, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.engine import get_db
@@ -83,7 +83,11 @@ class InternalLinkResponse(BaseModel):
     target_title: str
     target_url: str
     anchor_text: str
+    anchor_source: str = "title"  # "search_query" when backed by real GSC data, else "title"
+    anchor_impressions: int | None = None
+    anchor_clicks: int | None = None
     shared_keywords: list[str]
+    relevance_score: float | None = None
 
 
 @router.get("/seo-opportunities", response_model=list[SeoOpportunityResponse])
@@ -513,6 +517,11 @@ async def get_internal_links(
     offset: int = Query(0, ge=0),
     db: AsyncSession = Depends(get_db),
 ) -> list[dict[str, Any]]:
+    # Ranked by the relevance score InternalLinker computed (IDF-weighted
+    # keyword overlap) — not creation time, which is unreliable here since
+    # every suggestion from one run lands in the same DB transaction and can
+    # share an identical `created_at`.
+    relevance_expr = Alert.metadata_["relevance_score"].astext.cast(Float)
     query = (
         select(Alert, Site.name.label("site_name"))
         .join(Site, Alert.site_id == Site.id)
@@ -521,7 +530,7 @@ async def get_internal_links(
             Alert.type == "internal_link",
             Alert.status == "open",
         )
-        .order_by(Alert.created_at.desc())
+        .order_by(relevance_expr.desc().nullslast(), Alert.created_at.desc())
         .limit(limit)
         .offset(offset)
     )
@@ -539,7 +548,11 @@ async def get_internal_links(
             "target_title": (alert.metadata_ or {}).get("target_title", (alert.metadata_ or {}).get("target_page", "")),
             "target_url": (alert.metadata_ or {}).get("target_url", (alert.metadata_ or {}).get("target_page", "")),
             "anchor_text": (alert.metadata_ or {}).get("anchor_text", ""),
+            "anchor_source": (alert.metadata_ or {}).get("anchor_source", "title"),
+            "anchor_impressions": (alert.metadata_ or {}).get("anchor_impressions"),
+            "anchor_clicks": (alert.metadata_ or {}).get("anchor_clicks"),
             "shared_keywords": (alert.metadata_ or {}).get("shared_keywords", []),
+            "relevance_score": (alert.metadata_ or {}).get("relevance_score"),
         }
         for alert, site_name in rows
     ]

@@ -1047,7 +1047,9 @@ class ContentScorer(BaseAgent):
                     for post in all_posts:
                         path = _urlparse(post.url).path
                         if path in path_views:
-                            post.traffic_30d = path_views[path]
+                            new_traffic = path_views[path]
+                            post.traffic_trend = [post.traffic_30d, new_traffic]
+                            post.traffic_30d = new_traffic
         except Exception as exc:
             logger.warning("GA traffic population failed for site %s: %s", site_id, exc)
 
