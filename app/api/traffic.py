@@ -4,7 +4,7 @@ from typing import Any
 
 from fastapi import APIRouter, BackgroundTasks, Depends, Query
 from pydantic import BaseModel
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.engine import AsyncSessionLocal, get_db
@@ -36,6 +36,9 @@ class TrafficSnapshotResponse(BaseModel):
 class TrafficSummary(BaseModel):
     site_id: str
     site_name: str
+    snapshot_date: str
+    is_stale: bool
+    has_comparison: bool
     pageviews_today: int
     pageviews_yesterday: int
     change_pct: float
@@ -97,11 +100,33 @@ class RegenerateRequest(BaseModel):
     horizon_days: int = 7
 
 
+# ── Pure helpers (unit-testable without a DB session) ─────────────────────────
+
+def _pick_anchor_date(available_dates: set[str], today: str, yesterday: str) -> str | None:
+    """Pick the most recent date we actually have a snapshot for, so a summary
+    is never silently built from `None`. Prefers today; falls back to
+    yesterday when today's collection hasn't run yet."""
+    if today in available_dates:
+        return today
+    if yesterday in available_dates:
+        return yesterday
+    return None
+
+
+def _change_pct(anchor_value: float, previous_value: float | None) -> tuple[float, bool]:
+    """Day-over-day % change plus whether a real comparison point existed —
+    lets the caller distinguish "flat" from "nothing to compare against"."""
+    if not previous_value:
+        return 0.0, False
+    return round((anchor_value - previous_value) / previous_value * 100, 1), True
+
+
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 
 @router.get("/snapshots", response_model=list[TrafficSnapshotResponse])
 async def list_snapshots(
     site_id: str | None = None,
+    source: str | None = Query(None, pattern="^(ga4|estimated)$"),
     days: int = 30,
     limit: int = Query(300, ge=1, le=1000),
     db: AsyncSession = Depends(get_db),
@@ -118,6 +143,8 @@ async def list_snapshots(
     )
     if site_id:
         query = query.where(TrafficSnapshot.site_id == site_id)
+    if source:
+        query = query.where(TrafficSnapshot.source == source)
 
     rows = list(reversed((await db.execute(query)).all()))
     return [
@@ -140,6 +167,7 @@ async def traffic_summary(
     """Per-site summary: today vs yesterday, top pages."""
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     yesterday = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%d")
+    day_before = (datetime.now(timezone.utc) - timedelta(days=2)).strftime("%Y-%m-%d")
 
     sites_q = select(Site).where(Site.status != "inactive")
     if site_id:
@@ -148,30 +176,27 @@ async def traffic_summary(
 
     result = []
     for site in sites:
-        def _latest(date: str) -> TrafficSnapshot | None:
-            return None  # placeholder — fetched below
-
         snaps_r = await db.execute(
             select(TrafficSnapshot)
-            .where(TrafficSnapshot.site_id == site.id, TrafficSnapshot.date.in_([today, yesterday]))
-            .order_by(TrafficSnapshot.date.desc())
+            .where(TrafficSnapshot.site_id == site.id, TrafficSnapshot.date.in_([today, yesterday, day_before]))
         )
         snaps = {s.date: s for s in snaps_r.scalars().all()}
 
-        t = snaps.get(today) or snaps.get(yesterday)
-        p = snaps.get(yesterday) if t and t.date == today else None
-
-        if not t:
+        anchor_date = _pick_anchor_date(set(snaps.keys()), today, yesterday)
+        if anchor_date is None:
             continue
+        t = snaps[anchor_date]
+        prev_date = yesterday if anchor_date == today else day_before
+        p = snaps.get(prev_date)
 
-        pv_today = t.pageviews
-        pv_yesterday = p.pageviews if p else 0
-        change = ((pv_today - pv_yesterday) / pv_yesterday * 100) if pv_yesterday else 0.0
+        change, has_comparison = _change_pct(t.pageviews, p.pageviews if p else None)
 
         result.append({
             "site_id": site.id, "site_name": site.name,
-            "pageviews_today": pv_today, "pageviews_yesterday": pv_yesterday,
-            "change_pct": round(change, 1),
+            "snapshot_date": anchor_date, "is_stale": anchor_date != today,
+            "has_comparison": has_comparison,
+            "pageviews_today": t.pageviews, "pageviews_yesterday": p.pageviews if p else 0,
+            "change_pct": change,
             "sessions_today": t.sessions, "users_today": t.users,
             "bounce_rate": t.bounce_rate, "avg_session_duration": t.avg_session_duration,
             "top_pages": t.top_pages, "source": t.source,
@@ -180,13 +205,23 @@ async def traffic_summary(
     return result
 
 
+_TREND_METRICS = {
+    "pageviews": lambda s: s.pageviews,
+    "sessions": lambda s: s.sessions,
+    "users": lambda s: s.users,
+    "bounce_rate": lambda s: s.bounce_rate,
+    "avg_session_duration": lambda s: s.avg_session_duration,
+}
+
+
 @router.get("/trend")
 async def traffic_trend(
     site_id: str | None = None,
     days: int = 30,
+    metric: str = Query("pageviews", pattern="^(pageviews|sessions|users|bounce_rate|avg_session_duration)$"),
     db: AsyncSession = Depends(get_db),
 ) -> list[dict[str, Any]]:
-    """Chart-ready daily series: [{date, <site_name>: views, ...}]"""
+    """Chart-ready daily series: [{date, <site_name>: <metric value>, ...}]"""
     since = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d")
     query = (
         select(TrafficSnapshot, Site.name.label("site_name"))
@@ -198,11 +233,12 @@ async def traffic_trend(
         query = query.where(TrafficSnapshot.site_id == site_id)
 
     rows = (await db.execute(query)).all()
+    extract = _TREND_METRICS[metric]
     daily: dict[str, dict[str, Any]] = {}
     for snap, sname in rows:
         if snap.date not in daily:
             daily[snap.date] = {"date": snap.date}
-        daily[snap.date][sname] = snap.pageviews
+        daily[snap.date][sname] = extract(snap)
 
     return list(daily.values())
 
@@ -211,6 +247,8 @@ async def traffic_trend(
 async def list_traffic_alerts(
     site_id: str | None = None,
     status: str | None = None,
+    severity: list[str] = Query(default=[]),
+    alert_type: list[str] = Query(default=[]),
     limit: int = Query(200, ge=1, le=500),
     db: AsyncSession = Depends(get_db),
 ) -> list[dict[str, Any]]:
@@ -227,6 +265,10 @@ async def list_traffic_alerts(
         query = query.where(Alert.status == status)
     else:
         query = query.where(Alert.status.in_(["open", "acknowledged"]))
+    if severity:
+        query = query.where(Alert.severity.in_(severity))
+    if alert_type:
+        query = query.where(Alert.type.in_(alert_type))
 
     rows = (await db.execute(query)).all()
     return [
@@ -240,74 +282,64 @@ async def list_traffic_alerts(
     ]
 
 
+def _aggregate_top_pages(
+    snapshots: list[tuple[str, str, list[dict[str, Any]]]],
+) -> list[dict[str, Any]]:
+    """Sum page views across snapshots, keyed by (site_id, path) — two sites
+    sharing the same relative path (both have "/about", say) must never be
+    silently merged into one misleading row."""
+    pages: dict[tuple[str, str], dict[str, Any]] = {}
+    for site_id, site_name, top_pages in snapshots:
+        for p in top_pages:
+            path = p.get("path") or p.get("url", "")
+            key = (site_id, path)
+            if key not in pages:
+                pages[key] = {**p, "site_id": site_id, "site_name": site_name, "views": 0}
+            pages[key]["views"] += p.get("views", 0)
+    return sorted(pages.values(), key=lambda x: x["views"], reverse=True)
+
+
 @router.get("/top-pages")
 async def top_pages(
     site_id: str | None = None,
-    limit: int = 10,
+    days: int = Query(30, ge=1, le=365),
+    limit: int = Query(10, ge=1, le=100),
     db: AsyncSession = Depends(get_db),
 ) -> list[dict[str, Any]]:
-    """Aggregate top pages from the latest snapshot per site."""
-    subq = (
-        select(func.max(TrafficSnapshot.snapshot_at).label("latest"), TrafficSnapshot.site_id)
-        .group_by(TrafficSnapshot.site_id)
-        .subquery()
-    )
+    """Aggregate top pages across the last `days` days, attributed per site."""
+    since = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d")
     query = (
-        select(TrafficSnapshot)
-        .join(subq, (TrafficSnapshot.site_id == subq.c.site_id) & (TrafficSnapshot.snapshot_at == subq.c.latest))
+        select(TrafficSnapshot, Site.name.label("site_name"))
+        .join(Site, TrafficSnapshot.site_id == Site.id)
+        .where(TrafficSnapshot.date >= since)
     )
     if site_id:
         query = query.where(TrafficSnapshot.site_id == site_id)
 
-    snaps = (await db.execute(query)).scalars().all()
-    pages: dict[str, dict[str, Any]] = {}
-    for snap in snaps:
-        for p in snap.top_pages:
-            key = p.get("path") or p.get("url", "")
-            if key not in pages:
-                pages[key] = {**p, "views": 0}
-            pages[key]["views"] = pages[key]["views"] + p.get("views", 0)
-
-    return sorted(pages.values(), key=lambda x: x["views"], reverse=True)[:limit]
+    rows = (await db.execute(query)).all()
+    aggregated = _aggregate_top_pages([(snap.site_id, sname, snap.top_pages) for snap, sname in rows])
+    return aggregated[:limit]
 
 
-@router.get("/geo")
-async def geo_breakdown(
-    site_id: str | None = None,
-    db: AsyncSession = Depends(get_db),
-) -> dict[str, Any]:
-    """Aggregate geo breakdown from the latest snapshot per site."""
-    subq = (
-        select(func.max(TrafficSnapshot.snapshot_at).label("latest"), TrafficSnapshot.site_id)
-        .group_by(TrafficSnapshot.site_id)
-        .subquery()
-    )
-    query = select(TrafficSnapshot).join(
-        subq,
-        (TrafficSnapshot.site_id == subq.c.site_id) & (TrafficSnapshot.snapshot_at == subq.c.latest),
-    )
-    if site_id:
-        query = query.where(TrafficSnapshot.site_id == site_id)
-
-    snaps = (await db.execute(query)).scalars().all()
-
-    # Aggregate across sites
+def _aggregate_geo(snapshots: list[dict[str, list[dict[str, Any]]]]) -> dict[str, Any]:
+    """Sum country/region/city views across a set of snapshots (each a
+    {"countries": [...], "regions": [...], "cities": [...]} dict)."""
     country_totals: dict[str, dict[str, Any]] = {}
     region_totals: dict[str, int] = {}
     city_totals: list[dict[str, Any]] = []
 
-    for snap in snaps:
-        for c in (snap.geo_countries or []):
+    for snap in snapshots:
+        for c in (snap.get("countries") or []):
             key = c.get("country_code", c.get("country", ""))
             if key not in country_totals:
                 country_totals[key] = {**c, "views": 0, "sessions": 0}
             country_totals[key]["views"] += c.get("views", 0)
             country_totals[key]["sessions"] += c.get("sessions", 0)
 
-        for r in (snap.geo_regions or []):
+        for r in (snap.get("regions") or []):
             region_totals[r["region"]] = region_totals.get(r["region"], 0) + r.get("views", 0)
 
-        city_totals.extend(snap.geo_cities or [])
+        city_totals.extend(snap.get("cities") or [])
 
     total_views = sum(c["views"] for c in country_totals.values()) or 1
     countries = sorted(
@@ -331,6 +363,25 @@ async def geo_breakdown(
     cities = sorted(city_map.values(), key=lambda x: x["views"], reverse=True)[:25]
 
     return {"countries": countries, "regions": regions, "cities": cities}
+
+
+@router.get("/geo")
+async def geo_breakdown(
+    site_id: str | None = None,
+    days: int = Query(30, ge=1, le=365),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """Aggregate geo breakdown across the last `days` days."""
+    since = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d")
+    query = select(TrafficSnapshot).where(TrafficSnapshot.date >= since)
+    if site_id:
+        query = query.where(TrafficSnapshot.site_id == site_id)
+
+    snaps = (await db.execute(query)).scalars().all()
+    return _aggregate_geo([
+        {"countries": s.geo_countries, "regions": s.geo_regions, "cities": s.geo_cities}
+        for s in snaps
+    ])
 
 
 # ── AI Predictions ───────────────────────────────────────────────────────────
