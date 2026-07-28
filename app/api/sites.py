@@ -41,6 +41,7 @@ class SiteResponse(BaseModel):
     issues_count: int
     speed_score: int | None
     content_freshness: int | None
+    content_count: int
 
     model_config = {"from_attributes": True}
 
@@ -79,6 +80,7 @@ async def _enrich_site(site: Site, db: AsyncSession) -> dict[str, Any]:
         "issues_count": issues_count,
         "speed_score": speed_score,
         "content_freshness": content_freshness,
+        "content_count": len(post_scores),
     }
 
 
@@ -116,12 +118,17 @@ async def list_sites(db: AsyncSession = Depends(get_db)) -> list[dict[str, Any]]
     )
     speed_by_site = {sid: int(avg) for sid, avg in speed_r.all() if avg is not None}
 
-    # Content freshness: average post health score per site
+    # Content freshness + post count: one grouped query per site
     fresh_r = await db.execute(
-        select(ContentPost.site_id, func.avg(ContentPost.health_score))
+        select(ContentPost.site_id, func.avg(ContentPost.health_score), func.count(ContentPost.id))
         .group_by(ContentPost.site_id)
     )
-    fresh_by_site = {sid: int(avg) for sid, avg in fresh_r.all() if avg is not None}
+    fresh_by_site: dict[str, int] = {}
+    count_by_site: dict[str, int] = {}
+    for sid, avg, count in fresh_r.all():
+        if avg is not None:
+            fresh_by_site[sid] = int(avg)
+        count_by_site[sid] = count
 
     return [
         {
@@ -135,6 +142,7 @@ async def list_sites(db: AsyncSession = Depends(get_db)) -> list[dict[str, Any]]
             "issues_count": issues_by_site.get(s.id, 0),
             "speed_score": speed_by_site.get(s.id),
             "content_freshness": fresh_by_site.get(s.id),
+            "content_count": count_by_site.get(s.id, 0),
         }
         for s in sites
     ]

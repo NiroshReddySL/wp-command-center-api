@@ -42,10 +42,11 @@ async def list_alerts(
     offset: int = Query(0, ge=0),
     db: AsyncSession = Depends(get_db),
 ) -> list[dict[str, Any]]:
+    """Cross-agent alert listing — pass `agent` to scope to one agent (the
+    Watchdog page always does); omit it for a site's full alert history."""
     query = (
         select(Alert, Site.name.label("site_name"))
         .join(Site, Alert.site_id == Site.id)
-        .where(Alert.agent == "watchdog")
         .order_by(Alert.created_at.desc())
         .limit(limit)
         .offset(offset)
