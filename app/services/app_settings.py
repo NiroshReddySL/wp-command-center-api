@@ -3,7 +3,9 @@
 The AGENT_DEFINITIONS list is the single source of truth for which agents can
 be toggled: the API serves it to the Settings UI and the scheduler reads the
 same keys before each run, so the panel can never drift from real behavior.
-Toggles gate SCHEDULED runs only — a manual "Run agents" always runs everything.
+Toggles gate SCHEDULED runs. A manual "Run agents" trigger (see app/api/agents.py)
+lets the user pick a subset for that one run — these toggles are only used to
+pick the default selection, via AGENT_TOGGLE_KEY there.
 """
 from typing import Any
 

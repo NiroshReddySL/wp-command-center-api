@@ -33,6 +33,12 @@ class GoogleStatus(BaseModel):
     connected: bool
     email: str | None = None
     scopes: list[str] = []
+    expires_at: datetime | None = None
+
+
+class GoogleRefreshResult(BaseModel):
+    status: str
+    message: str
 
 
 class SiteConfigUpdate(BaseModel):
@@ -135,6 +141,7 @@ async def google_status(db: AsyncSession = Depends(get_db)) -> dict[str, Any]:
     return {
         "connected": True,
         "scopes": token.scope.split() if token.scope else [],
+        "expires_at": token.token_expiry,
     }
 
 
@@ -146,6 +153,47 @@ async def google_disconnect(db: AsyncSession = Depends(get_db)) -> dict[str, str
     if token:
         await db.delete(token)
     return {"status": "disconnected"}
+
+
+@router.post("/google/refresh", response_model=GoogleRefreshResult, dependencies=[Depends(require_user)])
+async def google_refresh(db: AsyncSession = Depends(get_db)) -> dict[str, str]:
+    """Force-renew the access token right now, instead of waiting for the
+    lazy refresh in get_google_token(). Lets Settings verify a connection is
+    still healthy on demand, and surfaces a clear "reconnect" signal if the
+    refresh token itself has been revoked — rather than staying silently
+    stuck showing "Connected" while every Google API call fails in the
+    background.
+    """
+    result = await db.execute(select(OAuthToken).where(OAuthToken.provider == "google"))
+    token = result.scalar_one_or_none()
+    if not token:
+        raise HTTPException(status_code=404, detail="Google is not connected")
+
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(
+            _TOKEN_URL,
+            data={
+                "grant_type": "refresh_token",
+                "client_id": settings.GA_CLIENT_ID,
+                "client_secret": settings.GA_CLIENT_SECRET,
+                "refresh_token": token.refresh_token,
+            },
+        )
+
+    if resp.status_code != 200:
+        # The refresh token is dead (revoked/expired) — clear the row so the
+        # UI falls back to "Connect Google" instead of a stale, false "Connected".
+        await db.delete(token)
+        raise HTTPException(
+            status_code=400,
+            detail="Google connection has expired or was revoked — please reconnect.",
+        )
+
+    data = resp.json()
+    token.access_token = data["access_token"]
+    token.token_expiry = datetime.now(timezone.utc) + timedelta(seconds=data.get("expires_in", 3600) - 60)
+    await db.flush()
+    return {"status": "refreshed", "message": "Google connection refreshed."}
 
 
 async def get_google_token(db: AsyncSession) -> OAuthToken | None:

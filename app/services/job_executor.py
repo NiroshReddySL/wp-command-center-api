@@ -29,6 +29,8 @@ AGENT_STEPS = [
     ("app.agents.flows.flow_classifier",     "FlowClassifier",   "Flow Classifier",      "flows"),
 ]
 
+AGENT_MODULES: dict[str, str] = {class_name: module_path for module_path, class_name, _, _ in AGENT_STEPS}
+
 AGENT_TIMEOUTS: dict[str, int] = {
     # ContentScorer commits progress incrementally (every CONTENT_COMMIT_EVERY
     # items, and per AI-recommendation chunk) and caps how much it attempts
@@ -37,7 +39,7 @@ AGENT_TIMEOUTS: dict[str, int] = {
     # not "everything analyzed so far is silently discarded".
     "ContentScorer":     600,
     "SEOAnalyzer":        60,
-    "InternalLinker":     30,
+    "InternalLinker":     150,  # bounded-concurrency live WordPress content fetches + GSC page-query lookups, to verify anchors
     "PluginAuditor":      180,
     "PerformanceMonitor": 300,
     "LinkChecker":        600,  # up to LINK_CHECK_MAX_URLS links per run
@@ -64,8 +66,10 @@ async def _safe_rollback(db) -> None:
 
 async def execute_job(job_id: str) -> None:
     """
-    Run all agents for a job sequentially, persisting step progress to DB
-    after every agent so the SSE poller can stream live updates to the client.
+    Run this job's own agents sequentially — whichever subset was selected at
+    creation time (see AgentJobStep rows), not a fixed global list — persisting
+    step progress to DB after every agent so the SSE poller can stream live
+    updates to the client.
 
     Uses its own AsyncSessionLocal session — never shares with any HTTP request.
     """
@@ -80,7 +84,17 @@ async def execute_job(job_id: str) -> None:
             job.started_at = _now()
             await db.commit()
 
-            for idx, (module_path, class_name, label, category) in enumerate(AGENT_STEPS):
+            steps_result = await db.execute(
+                select(AgentJobStep)
+                .where(AgentJobStep.job_id == job_id)
+                .order_by(AgentJobStep.step_index)
+            )
+            job_steps = steps_result.scalars().all()
+
+            for step in job_steps:
+                class_name = step.agent_name
+                module_path = AGENT_MODULES.get(class_name)
+
                 # Re-read job row to pick up stop_requested written by a stop endpoint
                 await db.refresh(job)
                 if job.stop_requested:
@@ -90,14 +104,6 @@ async def execute_job(job_id: str) -> None:
                     logger.info("Job %s stopped before agent %s", job_id, class_name)
                     return
 
-                # Load the pre-created step row
-                step_result = await db.execute(
-                    select(AgentJobStep).where(
-                        AgentJobStep.job_id == job_id,
-                        AgentJobStep.step_index == idx,
-                    )
-                )
-                step = step_result.scalar_one()
                 step.status = "running"
                 step.started_at = _now()
                 await db.commit()
@@ -105,6 +111,8 @@ async def execute_job(job_id: str) -> None:
                 timeout = AGENT_TIMEOUTS.get(class_name, 120)
                 step_status, step_error, alerts_count = "done", None, 0
                 try:
+                    if module_path is None:
+                        raise RuntimeError(f"Unknown agent {class_name!r} — no module registered")
                     mod = importlib.import_module(module_path)
                     AgentClass = getattr(mod, class_name)
                     agent = AgentClass(db)

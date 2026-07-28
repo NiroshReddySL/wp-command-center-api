@@ -1,4 +1,4 @@
-"""Manual agent trigger endpoint — runs all agents for a site on demand."""
+"""Manual agent trigger endpoint — runs a chosen subset of agents for a site on demand."""
 import asyncio
 import json
 import logging
@@ -8,7 +8,7 @@ from typing import Any, AsyncGenerator
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import selectinload
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -66,6 +66,43 @@ AGENT_STEPS = [
     ("app.agents.flows.flow_classifier",    "FlowClassifier",  "Flow Classifier",     "flows"),
 ]
 
+# Maps a manual-run agent (by class name) to the Agent Configuration toggle
+# that gates its SCHEDULED run — used only to pick sensible defaults for the
+# manual run picklist. InternalLinker shares SEOAnalyzer's toggle because the
+# scheduler runs them as a pair; ContentRepurposer has no scheduled
+# counterpart at all, so it has no toggle to default from.
+AGENT_TOGGLE_KEY: dict[str, str] = {
+    "ContentScorer": "optimizer.content",
+    "SEOAnalyzer": "optimizer.seo",
+    "InternalLinker": "optimizer.seo",
+    "PluginAuditor": "watchdog.plugins",
+    "PerformanceMonitor": "watchdog.performance",
+    "LinkChecker": "watchdog.links",
+    "FlowClassifier": "flows.classify",
+}
+
+
+class ManualAgentOption(BaseModel):
+    agent_name: str
+    label: str
+    category: str
+    default_enabled: bool
+
+
+class RunJobRequest(BaseModel):
+    # None (or omitted) runs every agent — back-compat default for any other caller.
+    agent_names: list[str] | None = None
+
+
+def _select_steps(
+    available: list[tuple[str, str, str, str]], agent_names: list[str] | None,
+) -> list[tuple[str, str, str, str]]:
+    """Filter AGENT_STEPS-shaped tuples down to the requested class names,
+    preserving AGENT_STEPS order. `None` means "run everything"."""
+    if agent_names is None:
+        return available
+    return [s for s in available if s[1] in agent_names]
+
 
 def _sse(event: str, data: dict) -> str:
     return f"event: {event}\ndata: {json.dumps(data)}\n\n"
@@ -90,7 +127,12 @@ async def _poll_job_stream(job_id: str) -> AsyncGenerator[str, None]:
             yield _sse("error", {"message": f"Job {job_id} not found"})
             return
 
-        yield _sse("start", {"job_id": job_id, "total": 7})
+        # Real step count for THIS job — varies with how many agents were
+        # selected at creation time, so it can never be a fixed constant.
+        total_r = await db.execute(
+            select(func.count()).select_from(AgentJobStep).where(AgentJobStep.job_id == job_id)
+        )
+        yield _sse("start", {"job_id": job_id, "total": total_r.scalar_one()})
         yield ": keepalive\n\n"
 
         while True:
@@ -165,7 +207,7 @@ async def run_agents_for_site(site_id: str) -> dict[str, int]:
 AGENT_TIMEOUTS: dict[str, int] = {
     "ContentScorer":    420,   # 7 min — parallel schema fetches + AI recs
     "SEOAnalyzer":       60,
-    "InternalLinker":    30,
+    "InternalLinker":    150,  # bounded-concurrency live WordPress content fetches + GSC page-query lookups, to verify anchors
     "PluginAuditor":     180,
     "PerformanceMonitor":300,  # PSI calls can be slow
     "LinkChecker":       600,  # up to LINK_CHECK_MAX_URLS links per run
@@ -268,9 +310,30 @@ async def _stream_agents(site_id: str) -> AsyncGenerator[str, None]:
 
 # ── Job-based routes (declare BEFORE /{site_id}/... to avoid route collision) ──
 
+@router.get("/manual-options", response_model=list[ManualAgentOption])
+async def list_manual_options(db: AsyncSession = Depends(get_db)) -> list[dict[str, Any]]:
+    """Agents selectable for a manual run, default-checked to match each
+    agent's Agent Configuration toggle (checked with no opinion if it has none)."""
+    from app.services.app_settings import get_agent_toggles
+
+    toggles = await get_agent_toggles(db)
+    return [
+        {
+            "agent_name": class_name,
+            "label": label,
+            "category": category,
+            "default_enabled": toggles.get(AGENT_TOGGLE_KEY.get(class_name, ""), True),
+        }
+        for _, class_name, label, category in AGENT_STEPS
+    ]
+
+
 @router.post("/{site_id}/run-job", dependencies=[Depends(job_limiter)])
-async def create_job(site_id: str, db: AsyncSession = Depends(get_db)) -> dict[str, Any]:
-    """Create a DB-backed AgentJob, fire detached executor task, return job_id immediately."""
+async def create_job(
+    site_id: str, payload: RunJobRequest | None = None, db: AsyncSession = Depends(get_db)
+) -> dict[str, Any]:
+    """Create a DB-backed AgentJob for the requested agents, fire detached
+    executor task, return job_id immediately."""
     from app.services.job_executor import AGENT_STEPS as EXEC_STEPS
 
     result = await db.execute(select(Site).where(Site.id == site_id))
@@ -278,11 +341,16 @@ async def create_job(site_id: str, db: AsyncSession = Depends(get_db)) -> dict[s
     if not site:
         raise HTTPException(status_code=404, detail="Site not found")
 
+    agent_names = payload.agent_names if payload else None
+    steps_to_run = _select_steps(EXEC_STEPS, agent_names)
+    if not steps_to_run:
+        raise HTTPException(status_code=400, detail="No agents selected")
+
     job = AgentJob(site_id=site_id)
     db.add(job)
     await db.flush()  # get job.id before creating steps
 
-    for idx, (_, class_name, label, category) in enumerate(EXEC_STEPS):
+    for idx, (_, class_name, label, category) in enumerate(steps_to_run):
         step = AgentJobStep(
             job_id=job.id,
             step_index=idx,
