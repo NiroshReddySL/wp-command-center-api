@@ -1,6 +1,7 @@
 import asyncio
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Any
+from urllib.parse import urlparse
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
 from pydantic import BaseModel
@@ -29,9 +30,61 @@ class SeoOpportunityResponse(BaseModel):
 
 def _slug_from_url(url: str) -> str | None:
     """Last path segment of the WP post URL — the human-readable slug."""
-    from urllib.parse import urlparse
     path = urlparse(url or "").path.strip("/")
     return path.rsplit("/", 1)[-1] if path else None
+
+
+# URL-slug substrings that identify a site's own Contact/Pricing page — never
+# a hardcoded path guess (every site's slugs differ), just a lens over
+# whatever pages this site's own ContentPost rows already contain.
+_CONVERSION_TARGET_NEEDLES: dict[str, list[str]] = {
+    "Contact": ["contact-us", "contact_us", "contact", "get-in-touch", "get-a-quote"],
+    "Pricing": ["pricing", "plans-pricing", "price-plans", "prices"],
+}
+
+
+def _detect_conversion_targets(
+    posts: list[tuple[str, str, str]], exclude_id: str,
+) -> dict[str, tuple[str, str, str]]:
+    """Best-guess Contact/Pricing page for this site, found in its own real
+    content — `posts` is [(id, title, url), ...] for the site. Prefers the
+    shortest matching URL path per category, since the canonical page
+    ("/contact/") is always shorter than an incidental blog post that just
+    happens to mention the word ("/contact-us-for-a-free-quote-guide/").
+    Never matches the post against itself.
+    """
+    found: dict[str, tuple[str, str, str]] = {}
+    for label, needles in _CONVERSION_TARGET_NEEDLES.items():
+        candidates = [
+            (pid, title, url) for pid, title, url in posts
+            if pid != exclude_id and any(n in url.lower() for n in needles)
+        ]
+        if candidates:
+            found[label] = min(candidates, key=lambda c: len(urlparse(c[2]).path))
+    return found
+
+
+def _pct_change(previous: int, current: int) -> float | None:
+    """None when there's no real baseline to compare against (0 in the
+    prior period) — a manufactured "+100%"/infinite% would be misleading."""
+    if previous == 0:
+        return None
+    return round((current - previous) / previous * 100, 1)
+
+
+def _fill_daily_gaps(day_counts: dict[str, int], start_date: str, end_date: str) -> list[dict[str, Any]]:
+    """GA4 omits days with zero activity entirely rather than returning a
+    zero row — reconciled here against every real calendar date in range so
+    a quiet day reads as 0 on the chart, not as a gap."""
+    start = datetime.strptime(start_date, "%Y-%m-%d").date()
+    end = datetime.strptime(end_date, "%Y-%m-%d").date()
+    points: list[dict[str, Any]] = []
+    day = start
+    while day <= end:
+        iso = day.isoformat()
+        points.append({"date": iso, "views": day_counts.get(iso, 0)})
+        day += timedelta(days=1)
+    return points
 
 
 class ContentHealthResponse(BaseModel):
@@ -315,16 +368,14 @@ async def get_content_health(
     return {"items": items, "total": total}
 
 
-@router.get("/content-health/{ref}", response_model=ContentHealthDetailResponse)
-async def get_content_post_detail(
-    ref: str,
-    site_id: str | None = None,
-    db: AsyncSession = Depends(get_db),
-) -> dict[str, Any]:
+async def _resolve_post_ref(
+    ref: str, site_id: str | None, db: AsyncSession,
+) -> tuple[ContentPost, str]:
     """Fetch one post by UUID or by its WP slug (clean URLs).
 
     Slug lookups can collide across sites — pass site_id to disambiguate;
-    otherwise the most recently analyzed match wins.
+    otherwise the most recently analyzed match wins. Shared by every
+    per-post endpoint below so "how a post is looked up" only lives once.
     """
     base = select(ContentPost, Site.name.label("site_name")).join(
         Site, ContentPost.site_id == Site.id
@@ -344,7 +395,16 @@ async def get_content_post_detail(
 
     if not row:
         raise HTTPException(status_code=404, detail="Post not found")
-    post, site_name = row
+    return row
+
+
+@router.get("/content-health/{ref}", response_model=ContentHealthDetailResponse)
+async def get_content_post_detail(
+    ref: str,
+    site_id: str | None = None,
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    post, site_name = await _resolve_post_ref(ref, site_id, db)
     return {
         "id": post.id,
         "slug": _slug_from_url(post.url) or post.id,
@@ -363,6 +423,120 @@ async def get_content_post_detail(
         "score_breakdown": post.score_breakdown or {},
         "ai_recommendation": post.ai_recommendation,
     }
+
+
+class DailyTrafficPoint(BaseModel):
+    date: str
+    views: int
+
+
+class ConversionFlow(BaseModel):
+    label: str
+    target_title: str
+    target_url: str
+    entered: int
+    reached: int
+    conversion_rate: float  # 0-1
+
+
+class ContentAnalyticsResponse(BaseModel):
+    connected: bool
+    daily_traffic: list[DailyTrafficPoint] = []
+    traffic_30d: int = 0
+    traffic_prev_30d: int = 0
+    traffic_change_pct: float | None = None
+    bounce_rate: float | None = None  # 0-100
+    avg_engagement_time: float | None = None  # seconds
+    flows: list[ConversionFlow] = []
+    error: str | None = None
+
+
+@router.get("/content-health/{ref}/analytics", response_model=ContentAnalyticsResponse)
+async def get_content_post_analytics(
+    ref: str,
+    site_id: str | None = None,
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """Real GA4 analytics for one post: a day-by-day 30-day traffic chart
+    (vs. the previous 30 days), bounce rate/engagement time, and how many of
+    this post's visitors went on to reach the site's own Contact/Pricing
+    page. Degrades gracefully — not connected, or a live GA4 error, both
+    return a normal 200 with `connected`/`error` set rather than a 500,
+    since this is a supplementary section of the page, not its core data.
+    """
+    from app.api.auth import get_google_token
+    from app.connectors.analytics import AnalyticsConnector
+    from app.database.models import SiteConfig
+
+    post, _site_name = await _resolve_post_ref(ref, site_id, db)
+
+    cfg_r = await db.execute(select(SiteConfig).where(SiteConfig.site_id == post.site_id))
+    cfg = cfg_r.scalar_one_or_none()
+    token = await get_google_token(db)
+    if not cfg or not cfg.ga_property_id or not token:
+        return {"connected": False}
+
+    today = datetime.now(timezone.utc).date()
+    range_start = (today - timedelta(days=29)).isoformat()
+    range_end = today.isoformat()
+    prev_start = (today - timedelta(days=59)).isoformat()
+    prev_end = (today - timedelta(days=30)).isoformat()
+    post_path = urlparse(post.url).path
+
+    try:
+        ga = AnalyticsConnector(token.access_token)
+
+        daily_by_path = await ga.get_daily_active_users_by_path(
+            cfg.ga_property_id, [post_path], prev_start, range_end,
+        )
+        day_counts = daily_by_path.get(post_path, {})
+        daily_traffic = _fill_daily_gaps(day_counts, range_start, range_end)
+        traffic_30d = sum(p["views"] for p in daily_traffic)
+        prev_points = _fill_daily_gaps(day_counts, prev_start, prev_end)
+        traffic_prev_30d = sum(p["views"] for p in prev_points)
+
+        engagement = (await ga.get_engagement_metrics_by_path(
+            cfg.ga_property_id, [post_path], range_start, range_end,
+        )).get(post_path)
+
+        posts_r = await db.execute(
+            select(ContentPost.id, ContentPost.title, ContentPost.url)
+            .where(ContentPost.site_id == post.site_id)
+        )
+        targets = _detect_conversion_targets(list(posts_r.all()), exclude_id=post.id)
+
+        flows: list[dict[str, Any]] = []
+        for label, (_target_id, target_title, target_url) in targets.items():
+            target_path = urlparse(target_url).path
+            funnel = await ga.run_funnel_report(
+                cfg.ga_property_id,
+                steps=[
+                    {"label": post.title[:60], "match_type": "contains", "pattern": post_path},
+                    {"label": label, "match_type": "contains", "pattern": target_path},
+                ],
+                start_date=range_start, end_date=range_end,
+            )
+            flows.append({
+                "label": label,
+                "target_title": target_title,
+                "target_url": target_url,
+                "entered": funnel["total_entered"],
+                "reached": funnel["total_completed"],
+                "conversion_rate": funnel["conversion_rate"],
+            })
+
+        return {
+            "connected": True,
+            "daily_traffic": daily_traffic,
+            "traffic_30d": traffic_30d,
+            "traffic_prev_30d": traffic_prev_30d,
+            "traffic_change_pct": _pct_change(traffic_prev_30d, traffic_30d),
+            "bounce_rate": round(engagement["bounce_rate"] * 100, 1) if engagement else None,
+            "avg_engagement_time": round(engagement["avg_engagement_time"], 1) if engagement else None,
+            "flows": flows,
+        }
+    except Exception as exc:
+        return {"connected": True, "error": f"Couldn't load live analytics: {exc}"}
 
 
 @router.post("/content-health/{post_id}/rescan", dependencies=[Depends(ai_limiter)])
