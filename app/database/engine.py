@@ -89,7 +89,6 @@ EXTRA_DDL: list[str] = [
             "CREATE INDEX IF NOT EXISTS idx_content_posts_type ON content_posts(site_id, content_type)",
             "CREATE INDEX IF NOT EXISTS idx_review_items_site_id ON review_items(site_id)",
             "CREATE INDEX IF NOT EXISTS idx_review_items_agent_status ON review_items(agent, status)",
-            "CREATE INDEX IF NOT EXISTS idx_traffic_snapshots_site_date ON traffic_snapshots(site_id, date)",
             "CREATE INDEX IF NOT EXISTS idx_performance_snapshots_site_at ON performance_snapshots(site_id, snapshot_at DESC)",
             "CREATE INDEX IF NOT EXISTS idx_variants_content_post_id ON variants(content_post_id)",
             "CREATE INDEX IF NOT EXISTS idx_plugin_audits_site_id ON plugin_audits(site_id)",
@@ -148,6 +147,43 @@ EXTRA_DDL: list[str] = [
             "CREATE INDEX IF NOT EXISTS idx_flow_category_steps_category_id ON flow_category_steps(flow_category_id)",
             "CREATE INDEX IF NOT EXISTS idx_flow_category_snapshots_category_range ON flow_category_snapshots(flow_category_id, range_start, range_end)",
             "CREATE INDEX IF NOT EXISTS idx_flow_category_snapshots_site_id ON flow_category_snapshots(site_id)",
+            # Goal steps — mark a step as the conversion event so the
+            # dashboard can report a real "leads" count.
+            "ALTER TABLE flow_category_steps ADD COLUMN IF NOT EXISTS is_goal BOOLEAN NOT NULL DEFAULT FALSE",
+            "ALTER TABLE flow_category_snapshots ADD COLUMN IF NOT EXISTS goal_step_index INTEGER",
+            "ALTER TABLE flow_category_snapshots ADD COLUMN IF NOT EXISTS leads INTEGER",
+            "ALTER TABLE flow_category_snapshots ADD COLUMN IF NOT EXISTS lead_rate DOUBLE PRECISION",
+            # One row per (site_id, date) — repeated "Flush & Re-run" clicks
+            # used to insert duplicate dates since there was no upsert.
+            # Dedupe first (keep real GA4 over estimated, then most recent),
+            # then guard the constraint add since Postgres has no ADD
+            # CONSTRAINT IF NOT EXISTS.
+            """
+            DELETE FROM traffic_snapshots
+            WHERE id IN (
+                SELECT id FROM (
+                    SELECT id,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY site_id, date
+                               ORDER BY (source = 'ga4') DESC, snapshot_at DESC, id DESC
+                           ) AS rn
+                    FROM traffic_snapshots
+                ) ranked
+                WHERE rn > 1
+            )
+            """,
+            """
+            DO $$
+            BEGIN
+                IF NOT EXISTS (
+                    SELECT 1 FROM pg_constraint WHERE conname = 'uq_traffic_snapshots_site_date'
+                ) THEN
+                    ALTER TABLE traffic_snapshots
+                        ADD CONSTRAINT uq_traffic_snapshots_site_date UNIQUE (site_id, date);
+                END IF;
+            END $$;
+            """,
+            "DROP INDEX IF EXISTS idx_traffic_snapshots_site_date",
 ]
 
 

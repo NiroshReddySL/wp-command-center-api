@@ -68,6 +68,7 @@ class FlowClassifier(BaseAgent):
             return alerts
 
         from app.api.auth import get_google_token
+        from app.api.flows import _compute_goal_metrics
         from app.connectors.analytics import AnalyticsConnector
 
         token = await get_google_token(self.db)
@@ -90,6 +91,11 @@ class FlowClassifier(BaseAgent):
                 )
                 continue
 
+            goal_step_index, leads, lead_rate = _compute_goal_metrics(
+                [{"step_index": s.step_index, "is_goal": s.is_goal} for s in category.steps],
+                result["step_results"], result["total_entered"],
+            )
+
             snapshot = FlowCategorySnapshot(
                 flow_category_id=category.id, site_id=site_id,
                 range_start=yesterday, range_end=yesterday,
@@ -97,6 +103,7 @@ class FlowClassifier(BaseAgent):
                 total_entered=result["total_entered"],
                 total_completed=result["total_completed"],
                 conversion_rate=result["conversion_rate"],
+                goal_step_index=goal_step_index, leads=leads, lead_rate=lead_rate,
             )
             self.db.add(snapshot)
             await self.db.flush()

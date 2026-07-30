@@ -236,6 +236,51 @@ class AnalyticsConnector:
             "avg_session_duration": round(float(vals[4]["value"]), 1),
         }
 
+    async def get_daily_site_metrics(self, property_id: str, days: int = 90) -> list[dict[str, Any]]:
+        """Day-by-day sitewide metrics for the last `days` days, in ONE
+        GA4 call — the historical backfill this powers doesn't need to wait
+        for the nightly agent to accumulate history one calendar day at a
+        time; GA4 already has it. Returns
+        [{date: "YYYY-MM-DD", pageviews, sessions, users, bounce_rate, avg_session_duration}, ...],
+        oldest first. GA4 omits a day's row entirely when nothing happened
+        that day — callers should not assume every calendar date appears.
+        """
+        if not property_id.startswith("properties/"):
+            property_id = f"properties/{property_id}"
+
+        body = {
+            "dateRanges": [{"startDate": f"{days}daysAgo", "endDate": "yesterday"}],
+            "dimensions": [{"name": "date"}],
+            "metrics": [
+                {"name": "screenPageViews"}, {"name": "sessions"}, {"name": "totalUsers"},
+                {"name": "bounceRate"}, {"name": "averageSessionDuration"},
+            ],
+            "orderBys": [{"dimension": {"dimensionName": "date"}}],
+        }
+
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            resp = await client.post(
+                f"{_GA4_URL}/{property_id}:runReport",
+                headers={"Authorization": f"Bearer {self.access_token}"},
+                json=body,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+
+        result = []
+        for row in data.get("rows", []):
+            raw_date = row["dimensionValues"][0]["value"]  # "20260415"
+            vals = row["metricValues"]
+            result.append({
+                "date": datetime.strptime(raw_date, "%Y%m%d").strftime("%Y-%m-%d"),
+                "pageviews": int(vals[0]["value"]),
+                "sessions": int(vals[1]["value"]),
+                "users": int(vals[2]["value"]),
+                "bounce_rate": round(float(vals[3]["value"]) * 100, 1),
+                "avg_session_duration": round(float(vals[4]["value"]), 1),
+            })
+        return result
+
     async def get_geo_breakdown(self, property_id: str, days: int = 1) -> dict[str, Any]:
         """Fetch country, macro-region, and city breakdowns from GA4."""
         if not property_id.startswith("properties/"):

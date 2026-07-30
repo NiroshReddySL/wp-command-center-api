@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.database.engine import AsyncSessionLocal, get_db
 from app.database.models import Alert, Site, TrafficSnapshot
 from app.security.rate_limit import ai_limiter, job_limiter
+from app.utils.date_ranges import resolve_date_range
 
 router = APIRouter()
 
@@ -93,6 +94,11 @@ class TrafficPredictionResponse(BaseModel):
     narrative: str
     model_version: str
     insufficient_data: bool = False
+    # True when there WAS enough history, but the AI call itself failed
+    # (bad/missing API key, rate limit, malformed response) and no earlier
+    # prediction exists to fall back to — a real, transient error, distinct
+    # from "insufficient_data" (which just needs more days of history).
+    generation_failed: bool = False
 
 
 class RegenerateRequest(BaseModel):
@@ -113,6 +119,20 @@ def _pick_anchor_date(available_dates: set[str], today: str, yesterday: str) -> 
     return None
 
 
+def _is_stale(anchor_date: str, today: str, yesterday: str) -> bool:
+    """A site is only flagged stale when even YESTERDAY's sync is missing.
+
+    GA4 itself always finalizes data one day behind — every GA4 snapshot
+    TrafficAgent writes is dated "yesterday", never "today" (see
+    TrafficAgent._fetch_ga4), because GA4 needs a full day to close out
+    metrics. Treating "anchor isn't today" as the staleness bar made every
+    properly-working GA4-connected site permanently "stale" by definition,
+    not by failure. Only a gap of 2+ days (anchor resolves to day_before,
+    i.e. not even yesterday landed) is a genuine sync problem.
+    """
+    return anchor_date not in (today, yesterday)
+
+
 def _change_pct(anchor_value: float, previous_value: float | None) -> tuple[float, bool]:
     """Day-over-day % change plus whether a real comparison point existed —
     lets the caller distinguish "flat" from "nothing to compare against"."""
@@ -127,17 +147,19 @@ def _change_pct(anchor_value: float, previous_value: float | None) -> tuple[floa
 async def list_snapshots(
     site_id: str | None = None,
     source: str | None = Query(None, pattern="^(ga4|estimated)$"),
-    days: int = 30,
+    range: str = "28d",
+    start_date: str | None = None,
+    end_date: str | None = None,
     limit: int = Query(300, ge=1, le=1000),
     db: AsyncSession = Depends(get_db),
 ) -> list[dict[str, Any]]:
-    since = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d")
+    since, until = resolve_date_range(range, start_date, end_date)
     # Order desc + limit keeps the MOST RECENT rows when capping, then restore
     # ascending order for charting.
     query = (
         select(TrafficSnapshot, Site.name.label("site_name"))
         .join(Site, TrafficSnapshot.site_id == Site.id)
-        .where(TrafficSnapshot.date >= since)
+        .where(TrafficSnapshot.date >= since, TrafficSnapshot.date <= until)
         .order_by(TrafficSnapshot.date.desc())
         .limit(limit)
     )
@@ -193,7 +215,7 @@ async def traffic_summary(
 
         result.append({
             "site_id": site.id, "site_name": site.name,
-            "snapshot_date": anchor_date, "is_stale": anchor_date != today,
+            "snapshot_date": anchor_date, "is_stale": _is_stale(anchor_date, today, yesterday),
             "has_comparison": has_comparison,
             "pageviews_today": t.pageviews, "pageviews_yesterday": p.pageviews if p else 0,
             "change_pct": change,
@@ -217,16 +239,18 @@ _TREND_METRICS = {
 @router.get("/trend")
 async def traffic_trend(
     site_id: str | None = None,
-    days: int = 30,
+    range: str = "28d",
+    start_date: str | None = None,
+    end_date: str | None = None,
     metric: str = Query("pageviews", pattern="^(pageviews|sessions|users|bounce_rate|avg_session_duration)$"),
     db: AsyncSession = Depends(get_db),
 ) -> list[dict[str, Any]]:
     """Chart-ready daily series: [{date, <site_name>: <metric value>, ...}]"""
-    since = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d")
+    since, until = resolve_date_range(range, start_date, end_date)
     query = (
         select(TrafficSnapshot, Site.name.label("site_name"))
         .join(Site, TrafficSnapshot.site_id == Site.id)
-        .where(TrafficSnapshot.date >= since)
+        .where(TrafficSnapshot.date >= since, TrafficSnapshot.date <= until)
         .order_by(TrafficSnapshot.date.asc())
     )
     if site_id:
@@ -302,16 +326,18 @@ def _aggregate_top_pages(
 @router.get("/top-pages")
 async def top_pages(
     site_id: str | None = None,
-    days: int = Query(30, ge=1, le=365),
+    range: str = "28d",
+    start_date: str | None = None,
+    end_date: str | None = None,
     limit: int = Query(10, ge=1, le=100),
     db: AsyncSession = Depends(get_db),
 ) -> list[dict[str, Any]]:
-    """Aggregate top pages across the last `days` days, attributed per site."""
-    since = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d")
+    """Aggregate top pages across the selected range, attributed per site."""
+    since, until = resolve_date_range(range, start_date, end_date)
     query = (
         select(TrafficSnapshot, Site.name.label("site_name"))
         .join(Site, TrafficSnapshot.site_id == Site.id)
-        .where(TrafficSnapshot.date >= since)
+        .where(TrafficSnapshot.date >= since, TrafficSnapshot.date <= until)
     )
     if site_id:
         query = query.where(TrafficSnapshot.site_id == site_id)
@@ -368,12 +394,14 @@ def _aggregate_geo(snapshots: list[dict[str, list[dict[str, Any]]]]) -> dict[str
 @router.get("/geo")
 async def geo_breakdown(
     site_id: str | None = None,
-    days: int = Query(30, ge=1, le=365),
+    range: str = "28d",
+    start_date: str | None = None,
+    end_date: str | None = None,
     db: AsyncSession = Depends(get_db),
 ) -> dict[str, Any]:
-    """Aggregate geo breakdown across the last `days` days."""
-    since = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d")
-    query = select(TrafficSnapshot).where(TrafficSnapshot.date >= since)
+    """Aggregate geo breakdown across the selected range."""
+    since, until = resolve_date_range(range, start_date, end_date)
+    query = select(TrafficSnapshot).where(TrafficSnapshot.date >= since, TrafficSnapshot.date <= until)
     if site_id:
         query = query.where(TrafficSnapshot.site_id == site_id)
 
@@ -394,7 +422,7 @@ async def get_predictions(
     db: AsyncSession = Depends(get_db),
 ) -> list[dict[str, Any]]:
     """Return cached AI traffic predictions (regenerates if stale or force=true)."""
-    from app.services.traffic_prediction import TrafficPredictionService
+    from app.services.traffic_prediction import PredictionGenerationFailed, TrafficPredictionService
 
     sites_q = select(Site).where(Site.status != "inactive")
     if site_id:
@@ -404,7 +432,18 @@ async def get_predictions(
     svc = TrafficPredictionService(db)
     results = []
     for site in sites:
-        pred = await svc.get_or_generate(site.id, horizon_days, force)
+        try:
+            pred = await svc.get_or_generate(site.id, horizon_days, force)
+        except PredictionGenerationFailed:
+            results.append({
+                "site_id": site.id, "site_name": site.name,
+                "horizon_days": horizon_days,
+                "generated_at": datetime.now(timezone.utc),
+                "daily_forecasts": [], "anomalies": [],
+                "narrative": "", "model_version": "gpt-4o",
+                "insufficient_data": False, "generation_failed": True,
+            })
+            continue
         if pred is None:
             results.append({
                 "site_id": site.id, "site_name": site.name,

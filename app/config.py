@@ -40,6 +40,13 @@ class Settings(BaseSettings):
     # timeout or crash only costs the current partial batch, never the
     # whole run.
     CONTENT_COMMIT_EVERY: int = 20
+    # Enable ONLY when the API sits behind a reverse proxy that overwrites
+    # X-Forwarded-For (nginx, an ALB, Cloudflare). It makes rate limiting
+    # key on the real client instead of the proxy's single IP — but since
+    # the header is client-settable, enabling it when NOT behind such a
+    # proxy would let anyone forge a fresh IP per request and bypass every
+    # limit. See app/security/rate_limit.py:_client_ip.
+    TRUST_PROXY_HEADERS: bool = False
     FRONTEND_URL: str = "http://localhost:5173"
     SECRET_KEY: str = "dev-secret-key-change-in-production"
     # Fallback MS Teams webhook (Power Automate Workflows URL). The UI-saved

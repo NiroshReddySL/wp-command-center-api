@@ -193,8 +193,15 @@ class PluginAudit(Base):
 
 
 class TrafficSnapshot(Base):
-    """Daily traffic snapshot per site, pulled from GA4 or estimated from post data."""
+    """Daily traffic snapshot per site, pulled from GA4 or estimated from post data.
+
+    One row per (site_id, date) — enforced, not just conventional. Without
+    it, repeated "Flush & Re-run" clicks (or a backfill re-covering a date
+    it already wrote) silently inserted duplicate rows for the same date
+    instead of updating the existing one.
+    """
     __tablename__ = "traffic_snapshots"
+    __table_args__ = (UniqueConstraint("site_id", "date", name="uq_traffic_snapshots_site_date"),)
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
     site_id: Mapped[str] = mapped_column(String(36), ForeignKey("sites.id", ondelete="CASCADE"), nullable=False)
@@ -382,6 +389,10 @@ class FlowCategoryStep(Base):
     pattern: Mapped[str] = mapped_column(String(512), nullable=False)
     is_directly_followed: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     within_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Marks this step as the flow's conversion event (e.g. a "thank you"
+    # page) — lets the dashboard report a real, explicitly-labeled "leads"
+    # count instead of assuming whichever step is last is the goal.
+    is_goal: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
 
     flow_category: Mapped["FlowCategory"] = relationship("FlowCategory", back_populates="steps")
 
@@ -412,6 +423,13 @@ class FlowCategorySnapshot(Base):
     total_entered: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     total_completed: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     conversion_rate: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)  # 0-1
+    # Which step (if any) was marked is_goal at the time this snapshot was
+    # computed, and that step's active_users — stored rather than
+    # re-derived from the category's current steps, so a snapshot's meaning
+    # of "leads" survives later step edits.
+    goal_step_index: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    leads: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    lead_rate: Mapped[float | None] = mapped_column(Float, nullable=True)  # 0-1, leads/total_entered
     breakdown_dimension: Mapped[str | None] = mapped_column(String(100), nullable=True)
     # [{value, step_index, active_users}] — present only if a breakdown was requested
     breakdown: Mapped[list[dict]] = mapped_column(JSON, default=list, nullable=False)

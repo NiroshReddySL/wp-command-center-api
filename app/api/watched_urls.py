@@ -28,6 +28,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.database.engine import get_db
 from app.database.models import ContentPost, Site, SiteConfig, WatchedUrl
 from app.security.rate_limit import job_limiter
+from app.utils.date_ranges import resolve_date_range
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -40,21 +41,6 @@ _URL_HEADER_NAMES = {"url", "urls"}
 _CSV_HEADER_NAMES = _URL_HEADER_NAMES | {"link", "links", "page", "path", "page url", "pageurl"}
 _MAX_URLS_PER_REQUEST = 500
 _MAX_CSV_BYTES = 2 * 1024 * 1024  # 2MB — plenty for tens of thousands of rows
-
-# GA4-style date range presets — "realtime" is the one exception (Active
-# Users right now, via the Realtime API); every other key resolves to REAL
-# calendar dates (not GA4's "NdaysAgo"/"today" relative keywords) so the
-# actual range is always known — needed to label the "Active Users" column,
-# name export files after the real dates instead of the preset key, and
-# enumerate exact calendar days for a day-wise breakdown.
-_RANGE_KEYS = frozenset({"today", "yesterday", "7d", "28d", "90d", "qtd", "ytd", "custom"})
-_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
-
-
-def _quarter_start(today: date) -> date:
-    first_month_of_quarter = ((today.month - 1) // 3) * 3 + 1
-    return date(today.year, first_month_of_quarter, 1)
-
 
 # ── Normalization ──────────────────────────────────────────────────────────────
 
@@ -287,42 +273,6 @@ async def _get_site_or_404(site_id: str, db: AsyncSession) -> Site:
     return site
 
 
-def _resolve_date_range(range_key: str, start_date: str | None, end_date: str | None) -> tuple[str, str]:
-    """Returns (start, end) as real YYYY-MM-DD calendar dates — "today" means
-    the actual current date, not the keyword GA4 would also accept."""
-    if range_key == "custom":
-        if not (start_date and end_date and _DATE_RE.match(start_date) and _DATE_RE.match(end_date)):
-            raise HTTPException(
-                status_code=422, detail="Custom range requires start_date and end_date as YYYY-MM-DD"
-            )
-        return start_date, end_date
-
-    if range_key not in _RANGE_KEYS:
-        raise HTTPException(
-            status_code=422,
-            detail=f"Unknown range '{range_key}' — expected one of realtime, {', '.join(sorted(_RANGE_KEYS))}",
-        )
-
-    today = datetime.now(timezone.utc).date()
-    if range_key == "today":
-        start = today
-    elif range_key == "yesterday":
-        start = today - timedelta(days=1)
-        today = start  # single-day range
-    elif range_key == "7d":
-        start = today - timedelta(days=6)   # 7 calendar days inclusive of today
-    elif range_key == "28d":
-        start = today - timedelta(days=27)
-    elif range_key == "90d":
-        start = today - timedelta(days=89)
-    elif range_key == "qtd":
-        start = _quarter_start(today)
-    else:  # ytd
-        start = date(today.year, 1, 1)
-
-    return start.isoformat(), today.isoformat()
-
-
 def _date_range_list(start_iso: str, end_iso: str) -> list[str]:
     """Every calendar date from start to end inclusive — used to fill in
     days a path had zero activity, since GA4 simply omits those rows."""
@@ -400,7 +350,7 @@ async def list_watched_urls(
     db: AsyncSession = Depends(get_db),
 ) -> WatchedUrlListResponse:
     """`range` mirrors GA4's own date-range picker: "realtime" (Active Users
-    right now) or a preset/custom date range — see _RANGE_KEYS. Realtime can
+    right now) or a preset/custom date range — see RANGE_KEYS. Realtime can
     only be matched by page title (GA4 API limitation); every other range
     matches directly by path, which is more precise.
     """
@@ -431,7 +381,7 @@ async def list_watched_urls(
     range_start: str | None = None
     range_end: str | None = None
     if range != "realtime":
-        range_start, range_end = _resolve_date_range(range, start_date, end_date)
+        range_start, range_end = resolve_date_range(range, start_date, end_date)
 
     cfg = (await db.execute(select(SiteConfig).where(SiteConfig.site_id == site_id))).scalar_one_or_none()
     ga_connected = False
@@ -498,7 +448,7 @@ async def get_daily_active_users(
 ) -> DailyActiveUsersResponse:
     """Day-by-day Active Users per watched URL — the data behind a "day-wise
     breakdown" export. "Realtime" has no calendar days to break down, so
-    it isn't a valid range here (every other _RANGE_KEYS preset, plus
+    it isn't a valid range here (every other RANGE_KEYS preset, plus
     custom, is)."""
     if range == "realtime":
         raise HTTPException(
@@ -506,7 +456,7 @@ async def get_daily_active_users(
         )
 
     await _get_site_or_404(site_id, db)  # 404 if the site doesn't exist
-    start, end = _resolve_date_range(range, start_date, end_date)
+    start, end = resolve_date_range(range, start_date, end_date)
     all_dates = _date_range_list(start, end)
 
     rows_r = await db.execute(

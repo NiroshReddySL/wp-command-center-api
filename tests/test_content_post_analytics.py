@@ -1,10 +1,18 @@
 """Content Analysis page's Analytics Overview — added so a per-post detail
 page can show real 30-day traffic, bounce rate, and how many visitors from
-that post reached the site's own Contact/Pricing page (a real GA4 funnel,
-not a form-submission count — that data doesn't exist anywhere in this
-codebase or the connected GA4 property yet).
+that post reached the site's own Contact/Pricing page via a real GA4
+funnel. Initially shipped as a "page reached" proxy since no form-submission
+tracking existed; extended once the site's actual form setup was confirmed
+to redirect to a shared confirmation ("thank you") page on success — adding
+that page as an optional 3rd funnel step turns "reached" into a real,
+attributable "submitted" conversion count.
 """
-from app.api.optimizer import _detect_conversion_targets, _fill_daily_gaps, _pct_change
+from app.api.optimizer import (
+    _detect_confirmation_page,
+    _detect_conversion_targets,
+    _fill_daily_gaps,
+    _pct_change,
+)
 
 
 class TestDetectConversionTargets:
@@ -47,6 +55,34 @@ class TestDetectConversionTargets:
         posts = [("1", "Contact", "https://example.com/CONTACT/")]
         result = _detect_conversion_targets(posts, exclude_id="2")
         assert "Contact" in result
+
+
+class TestDetectConfirmationPage:
+    def test_finds_a_thanks_page(self) -> None:
+        posts = [
+            ("1", "Thank You", "https://example.com/thanks/"),
+            ("2", "Some Blog Post", "https://example.com/blog/some-post/"),
+        ]
+        assert _detect_confirmation_page(posts) == ("1", "Thank You", "https://example.com/thanks/")
+
+    def test_finds_a_hyphenated_thank_you_page(self) -> None:
+        posts = [("1", "Thank You", "https://example.com/thank-you/")]
+        assert _detect_confirmation_page(posts) is not None
+
+    def test_prefers_the_shortest_matching_path(self) -> None:
+        posts = [
+            ("1", "Thanks", "https://example.com/thanks/"),
+            ("2", "Thanks for contacting us about our services", "https://example.com/thanks-for-contacting-us-about-our-services/"),
+        ]
+        result = _detect_confirmation_page(posts)
+        assert result is not None and result[0] == "1"
+
+    def test_returns_none_when_no_confirmation_page_exists(self) -> None:
+        posts = [("1", "Some Blog Post", "https://example.com/blog/some-post/")]
+        assert _detect_confirmation_page(posts) is None
+
+    def test_returns_none_for_an_empty_site(self) -> None:
+        assert _detect_confirmation_page([]) is None
 
 
 class TestPctChange:

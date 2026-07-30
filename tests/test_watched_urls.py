@@ -7,10 +7,7 @@ URL must be confirmed as belonging to the site before it's trusted (that
 same host-matching also closes the SSRF door, since every later fetch
 targets site.url + path, never an arbitrary user-supplied host).
 """
-from datetime import date, datetime, timedelta, timezone
-
 import pytest
-from fastapi import HTTPException
 
 from app.api.watched_urls import (
     _date_range_list,
@@ -18,8 +15,6 @@ from app.api.watched_urls import (
     _parse_csv_urls,
     _path_variants,
     _pick_variant,
-    _quarter_start,
-    _resolve_date_range,
 )
 
 SITE_URL = "https://www.example.com"
@@ -103,69 +98,6 @@ class TestParseCsvUrls:
         assert _parse_csv_urls(b"") == []
 
 
-class TestResolveDateRange:
-    """Every preset now resolves to REAL calendar dates (not GA4's "today" /
-    "NdaysAgo" relative keywords) — needed to label the Active Users column,
-    name exports after actual dates, and enumerate exact days for a
-    day-wise breakdown. Expectations are computed from the real clock so
-    these don't rot into a flaky hardcoded-date test."""
-
-    def test_today_preset(self) -> None:
-        today = datetime.now(timezone.utc).date().isoformat()
-        assert _resolve_date_range("today", None, None) == (today, today)
-
-    def test_yesterday_preset(self) -> None:
-        yesterday = (datetime.now(timezone.utc).date() - timedelta(days=1)).isoformat()
-        assert _resolve_date_range("yesterday", None, None) == (yesterday, yesterday)
-
-    def test_7d_preset_spans_exactly_7_calendar_days_inclusive_of_today(self) -> None:
-        today = datetime.now(timezone.utc).date()
-        start, end = _resolve_date_range("7d", None, None)
-        assert end == today.isoformat()
-        assert start == (today - timedelta(days=6)).isoformat()
-        assert (date.fromisoformat(end) - date.fromisoformat(start)).days == 6  # 6 nights = 7 days
-
-    def test_28d_preset_spans_28_days(self) -> None:
-        start, end = _resolve_date_range("28d", None, None)
-        assert (date.fromisoformat(end) - date.fromisoformat(start)).days == 27
-
-    def test_90d_preset_spans_90_days(self) -> None:
-        start, end = _resolve_date_range("90d", None, None)
-        assert (date.fromisoformat(end) - date.fromisoformat(start)).days == 89
-
-    def test_qtd_starts_on_the_first_of_the_current_quarter(self) -> None:
-        today = datetime.now(timezone.utc).date()
-        start, end = _resolve_date_range("qtd", None, None)
-        assert end == today.isoformat()
-        assert date.fromisoformat(start) == _quarter_start(today)
-        assert date.fromisoformat(start).month in (1, 4, 7, 10)
-        assert date.fromisoformat(start).day == 1
-
-    def test_ytd_starts_on_january_first(self) -> None:
-        today = datetime.now(timezone.utc).date()
-        start, end = _resolve_date_range("ytd", None, None)
-        assert end == today.isoformat()
-        assert start == date(today.year, 1, 1).isoformat()
-
-    def test_custom_range_with_valid_dates(self) -> None:
-        assert _resolve_date_range("custom", "2026-01-01", "2026-01-31") == ("2026-01-01", "2026-01-31")
-
-    def test_custom_range_missing_dates_raises_422(self) -> None:
-        with pytest.raises(HTTPException) as exc_info:
-            _resolve_date_range("custom", None, None)
-        assert exc_info.value.status_code == 422
-
-    def test_custom_range_malformed_date_raises_422(self) -> None:
-        with pytest.raises(HTTPException) as exc_info:
-            _resolve_date_range("custom", "01/01/2026", "2026-01-31")
-        assert exc_info.value.status_code == 422
-
-    def test_unknown_range_key_raises_422(self) -> None:
-        with pytest.raises(HTTPException) as exc_info:
-            _resolve_date_range("last-year", None, None)
-        assert exc_info.value.status_code == 422
-
-
 class TestPathVariants:
     def test_includes_both_trailing_slash_forms(self) -> None:
         assert _path_variants("/pricing/") == {"/pricing/", "/pricing"}
@@ -206,23 +138,6 @@ class TestPickVariant:
 
     def test_returns_none_when_no_variant_has_data(self) -> None:
         assert _pick_variant("/pricing/", {}) is None
-
-
-class TestQuarterStart:
-    def test_q1(self) -> None:
-        assert _quarter_start(date(2026, 2, 15)) == date(2026, 1, 1)
-
-    def test_q2(self) -> None:
-        assert _quarter_start(date(2026, 5, 20)) == date(2026, 4, 1)
-
-    def test_q3(self) -> None:
-        assert _quarter_start(date(2026, 7, 21)) == date(2026, 7, 1)
-
-    def test_q4(self) -> None:
-        assert _quarter_start(date(2026, 11, 1)) == date(2026, 10, 1)
-
-    def test_first_day_of_quarter_returns_itself(self) -> None:
-        assert _quarter_start(date(2026, 10, 1)) == date(2026, 10, 1)
 
 
 class TestDateRangeList:

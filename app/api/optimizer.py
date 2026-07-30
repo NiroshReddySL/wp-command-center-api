@@ -10,7 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.engine import get_db
 from app.database.models import Alert, ContentPost, Site
-from app.security.rate_limit import ai_limiter, job_limiter
+from app.security.rate_limit import ai_limiter, job_limiter, rescan_limiter
 
 router = APIRouter()
 
@@ -62,6 +62,26 @@ def _detect_conversion_targets(
         if candidates:
             found[label] = min(candidates, key=lambda c: len(urlparse(c[2]).path))
     return found
+
+
+# URL-slug substrings for a form-submission confirmation page ("thank you"
+# page) — the same detect-from-real-content approach as Contact/Pricing, so
+# a redirect-after-submit page turns "reached Contact" into a real,
+# attributable "submitted the form" count without hardcoding any site's URL.
+_CONFIRMATION_PAGE_NEEDLES = ["thank-you", "thanks", "thank_you", "form-submitted", "confirmation", "success"]
+
+
+def _detect_confirmation_page(posts: list[tuple[str, str, str]]) -> tuple[str, str, str] | None:
+    """The site's own post-submission confirmation page, if one exists —
+    used as an optional 3rd funnel step. None if nothing matches, so a site
+    without one just keeps the existing "page reached" flows unchanged."""
+    candidates = [
+        (pid, title, url) for pid, title, url in posts
+        if any(n in url.lower() for n in _CONFIRMATION_PAGE_NEEDLES)
+    ]
+    if not candidates:
+        return None
+    return min(candidates, key=lambda c: len(urlparse(c[2]).path))
 
 
 def _pct_change(previous: int, current: int) -> float | None:
@@ -436,7 +456,9 @@ class ConversionFlow(BaseModel):
     target_url: str
     entered: int
     reached: int
-    conversion_rate: float  # 0-1
+    reach_rate: float  # 0-1, reached/entered
+    submitted: int | None = None  # None when no confirmation page was detected for this site
+    submission_rate: float | None = None  # 0-1, submitted/entered
 
 
 class ContentAnalyticsResponse(BaseModel):
@@ -448,6 +470,7 @@ class ContentAnalyticsResponse(BaseModel):
     bounce_rate: float | None = None  # 0-100
     avg_engagement_time: float | None = None  # seconds
     flows: list[ConversionFlow] = []
+    total_leads: int | None = None  # sum of `submitted` across flows; None if no confirmation page detected
     error: str | None = None
 
 
@@ -460,7 +483,11 @@ async def get_content_post_analytics(
     """Real GA4 analytics for one post: a day-by-day 30-day traffic chart
     (vs. the previous 30 days), bounce rate/engagement time, and how many of
     this post's visitors went on to reach the site's own Contact/Pricing
-    page. Degrades gracefully — not connected, or a live GA4 error, both
+    page. When the site has a form-submission confirmation ("thank you")
+    page, the funnel extends to it as a 3rd step, so `reached` (got to the
+    Contact/Pricing page) and `submitted` (actually completed the form) are
+    reported as distinct, real conversion counts rather than one proxy
+    number. Degrades gracefully — not connected, or a live GA4 error, both
     return a normal 200 with `connected`/`error` set rather than a 500,
     since this is a supplementary section of the page, not its core data.
     """
@@ -499,31 +526,44 @@ async def get_content_post_analytics(
             cfg.ga_property_id, [post_path], range_start, range_end,
         )).get(post_path)
 
-        posts_r = await db.execute(
+        all_posts = list((await db.execute(
             select(ContentPost.id, ContentPost.title, ContentPost.url)
             .where(ContentPost.site_id == post.site_id)
-        )
-        targets = _detect_conversion_targets(list(posts_r.all()), exclude_id=post.id)
+        )).all())
+        targets = _detect_conversion_targets(all_posts, exclude_id=post.id)
+        confirmation = _detect_confirmation_page(all_posts)
 
         flows: list[dict[str, Any]] = []
         for label, (_target_id, target_title, target_url) in targets.items():
-            target_path = urlparse(target_url).path
+            steps = [
+                {"label": post.title[:60], "match_type": "contains", "pattern": post_path},
+                {"label": label, "match_type": "contains", "pattern": urlparse(target_url).path},
+            ]
+            if confirmation:
+                steps.append({
+                    "label": "Submitted", "match_type": "contains",
+                    "pattern": urlparse(confirmation[2]).path,
+                })
+
             funnel = await ga.run_funnel_report(
-                cfg.ga_property_id,
-                steps=[
-                    {"label": post.title[:60], "match_type": "contains", "pattern": post_path},
-                    {"label": label, "match_type": "contains", "pattern": target_path},
-                ],
-                start_date=range_start, end_date=range_end,
+                cfg.ga_property_id, steps=steps, start_date=range_start, end_date=range_end,
             )
+            entered = funnel["step_results"][0]["active_users"]
+            reached = funnel["step_results"][1]["active_users"]
+            submitted = funnel["step_results"][2]["active_users"] if confirmation else None
+
             flows.append({
                 "label": label,
                 "target_title": target_title,
                 "target_url": target_url,
-                "entered": funnel["total_entered"],
-                "reached": funnel["total_completed"],
-                "conversion_rate": funnel["conversion_rate"],
+                "entered": entered,
+                "reached": reached,
+                "reach_rate": (reached / entered) if entered else 0.0,
+                "submitted": submitted,
+                "submission_rate": (submitted / entered) if confirmation and entered else None,
             })
+
+        total_leads = sum(f["submitted"] for f in flows) if confirmation and flows else None
 
         return {
             "connected": True,
@@ -534,12 +574,13 @@ async def get_content_post_analytics(
             "bounce_rate": round(engagement["bounce_rate"] * 100, 1) if engagement else None,
             "avg_engagement_time": round(engagement["avg_engagement_time"], 1) if engagement else None,
             "flows": flows,
+            "total_leads": total_leads,
         }
     except Exception as exc:
         return {"connected": True, "error": f"Couldn't load live analytics: {exc}"}
 
 
-@router.post("/content-health/{post_id}/rescan", dependencies=[Depends(ai_limiter)])
+@router.post("/content-health/{post_id}/rescan", dependencies=[Depends(rescan_limiter)])
 async def rescan_content_post(
     post_id: str,
     db: AsyncSession = Depends(get_db),

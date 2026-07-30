@@ -13,6 +13,7 @@ from app.api.traffic import (
     _aggregate_geo,
     _aggregate_top_pages,
     _change_pct,
+    _is_stale,
     _pick_anchor_date,
 )
 
@@ -26,6 +27,22 @@ class TestPickAnchorDate:
 
     def test_none_when_neither_present(self) -> None:
         assert _pick_anchor_date({"2026-07-01"}, "2026-07-28", "2026-07-27") is None
+
+
+class TestIsStale:
+    """GA4 itself always finalizes "yesterday", never "today" — a
+    GA4-connected site's anchor date is expected to be yesterday on every
+    normal day, so that alone must never count as stale. Only a genuine
+    2+ day gap (anchor falls back to day_before) is a real sync problem."""
+
+    def test_anchor_is_today_is_not_stale(self) -> None:
+        assert _is_stale("2026-07-30", "2026-07-30", "2026-07-29") is False
+
+    def test_anchor_is_yesterday_is_not_stale(self) -> None:
+        assert _is_stale("2026-07-29", "2026-07-30", "2026-07-29") is False
+
+    def test_anchor_is_day_before_yesterday_is_stale(self) -> None:
+        assert _is_stale("2026-07-28", "2026-07-30", "2026-07-29") is True
 
 
 class TestChangePct:

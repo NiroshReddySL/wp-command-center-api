@@ -73,18 +73,49 @@ Write ONE alternative headline that:
 Return only the alternative headline text, nothing else."""
 
 
-def traffic_prediction_prompt(site_name: str, history_csv: str, horizon_days: int) -> str:
+def traffic_prediction_prompt(
+    site_name: str, history_csv: str, horizon_days: int, has_search_data: bool = False,
+) -> str:
+    search_columns_note = """
+The last four columns come from Google Search Console (organic Google search only):
+  impressions  — times the site appeared in search results that day
+  clicks       — clicks from those results
+  ctr_pct      — clicks/impressions as a percentage
+  avg_position — impression-weighted average ranking (LOWER is better)
+A BLANK in these columns means Search Console had not finalized that day yet
+(it runs 2-3 days behind analytics) — treat it as UNKNOWN, never as zero.
+""" if has_search_data else ""
+
+    search_analysis = """
+5. LEADING INDICATORS from the search columns — impressions move BEFORE
+   pageviews do, so use them to anticipate turns rather than just describe
+   the past:
+   - impressions trending up while clicks/pageviews stay flat  -> traffic likely to rise; rankings or demand are improving first
+   - impressions trending down                                 -> forecast a decline even if pageviews look stable today
+   - impressions steady but ctr_pct falling                    -> a SERP/snippet/competitor problem, not a demand problem
+   - avg_position worsening (rising number)                    -> ranking slide; expect impressions then clicks to follow
+   Weight these leading signals ahead of raw pageview momentum where they disagree.
+""" if has_search_data else ""
+
+    narrative_spec = (
+        "<2-3 paragraphs: trend direction, seasonality patterns, key risks, and one "
+        "specific actionable opportunity. Explicitly separate DEMAND changes (impressions) "
+        "from CONVERSION changes (CTR/position), and say which is driving the forecast>"
+        if has_search_data else
+        "<2-3 paragraphs: trend direction, seasonality patterns, key risks, and one specific actionable opportunity>"
+    )
+
     return f"""You are a web analytics forecasting model. Analyze the traffic history for the site "{site_name}" and predict the next {horizon_days} days.
 
 HISTORICAL DATA (CSV, most recent last):
 {history_csv}
-
+{search_columns_note}
 Analyze for:
 1. Overall trend (growing / declining / flat — estimate % change per week)
 2. Day-of-week seasonality (which days are consistently higher or lower)
 3. Any weekly or monthly cycles visible in the data
 4. Recent anomalies or inflection points in the last 14 days
-
+{search_analysis}
 Return a JSON object with EXACTLY this schema — no extra keys, no markdown:
 {{
   "daily_forecasts": [
@@ -93,7 +124,7 @@ Return a JSON object with EXACTLY this schema — no extra keys, no markdown:
   "anomalies": [
     {{"date": "YYYY-MM-DD", "type": "spike|drop|trend_break", "description": "<string>", "severity": "low|medium|high"}}
   ],
-  "narrative": "<2-3 paragraphs: trend direction, seasonality patterns, key risks, and one specific actionable opportunity>"
+  "narrative": "{narrative_spec}"
 }}
 
 Rules:

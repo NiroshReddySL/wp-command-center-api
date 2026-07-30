@@ -9,6 +9,7 @@ USER-scoped, not a literal per-session classification. There is no list of
 sessions/users outside BigQuery Export); the closest honest equivalent is
 an optional one-dimension breakdown sliced across every step.
 """
+import logging
 import re
 from typing import Any
 
@@ -22,7 +23,9 @@ from sqlalchemy.orm import selectinload
 from app.database.engine import get_db
 from app.database.models import FlowCategory, FlowCategorySnapshot, FlowCategoryStep, Site, SiteConfig
 from app.security.rate_limit import ai_limiter, job_limiter
+from app.utils.date_ranges import previous_period, resolve_date_range
 
+logger = logging.getLogger(__name__)
 router = APIRouter()
 
 _MATCH_TYPES = {"contains", "exact", "regex"}
@@ -43,6 +46,10 @@ class FlowStepIn(BaseModel):
     pattern: str = Field(min_length=1, max_length=512)
     is_directly_followed: bool = False
     within_seconds: int | None = Field(default=None, ge=1, le=86400)
+    # Marks this step as the flow's conversion event (e.g. a "thank you"
+    # page) — see _compute_goal_metrics for how this turns into a real,
+    # explicitly-labeled "leads" count rather than an assumed last step.
+    is_goal: bool = False
 
     @field_validator("match_type")
     @classmethod
@@ -60,6 +67,7 @@ class FlowStepResponse(BaseModel):
     pattern: str
     is_directly_followed: bool
     within_seconds: int | None
+    is_goal: bool
 
     model_config = {"from_attributes": True}
 
@@ -105,6 +113,9 @@ class FlowSnapshotResponse(BaseModel):
     total_entered: int
     total_completed: int
     conversion_rate: float
+    goal_step_index: int | None
+    leads: int | None
+    lead_rate: float | None
     breakdown_dimension: str | None
     breakdown: list[dict]
 
@@ -117,10 +128,38 @@ class RunFlowRequest(BaseModel):
     breakdown_dimension: str | None = None
 
 
+class FlowRangeStats(BaseModel):
+    """A funnel result for one specific date range, queried live from GA4 —
+    the data behind the dashboard's global date picker. Unlike
+    FlowSnapshotResponse this is never persisted, so it never has an id."""
+    range_start: str
+    range_end: str
+    step_results: list[dict]
+    total_entered: int
+    total_completed: int
+    conversion_rate: float
+    goal_step_index: int | None
+    leads: int | None
+    lead_rate: float | None
+
+
 class FlowDashboardItem(BaseModel):
     category: FlowCategoryResponse
-    latest: FlowSnapshotResponse | None
-    trend: list[FlowSnapshotResponse]  # daily snapshots, chronological
+    # Live GA4 result for the dashboard's globally selected date range (and,
+    # when comparing, the immediately preceding period of equal length).
+    # None when GA4 isn't connected, the category has no steps yet, or the
+    # live query failed — never merely because entrants were 0.
+    current: FlowRangeStats | None
+    previous: FlowRangeStats | None
+    trend: list[FlowSnapshotResponse]  # nightly daily snapshots, chronological — unaffected by the picker
+
+
+class FlowDashboardResponse(BaseModel):
+    range_start: str
+    range_end: str
+    previous_range_start: str | None
+    previous_range_end: str | None
+    items: list[FlowDashboardItem]
 
 
 # ── Helpers ─────────────────────────────────────────────────────────────────────
@@ -138,9 +177,29 @@ def _build_steps(steps_in: list[FlowStepIn]) -> list[FlowCategoryStep]:
         FlowCategoryStep(
             step_index=i, label=s.label.strip(), match_type=s.match_type, pattern=s.pattern.strip(),
             is_directly_followed=s.is_directly_followed, within_seconds=s.within_seconds,
+            is_goal=s.is_goal,
         )
         for i, s in enumerate(steps_in)
     ]
+
+
+def _compute_goal_metrics(
+    steps: list[dict[str, Any]], step_results: list[dict[str, Any]], total_entered: int,
+) -> tuple[int | None, int | None, float | None]:
+    """Which step (if any) is marked as the goal, and its real lead count —
+    `steps` is [{step_index, is_goal}, ...] for the category as configured
+    AT THE TIME of this run (a snapshot stores the result, not a live
+    reference, so later step edits never rewrite history). The first step
+    marked is_goal wins if more than one somehow is; (None, None, None)
+    when no step is a goal, so a plain content-journey flow is left
+    completely unchanged."""
+    goal = next((s for s in steps if s.get("is_goal")), None)
+    if goal is None:
+        return None, None, None
+    result = next((r for r in step_results if r["step_index"] == goal["step_index"]), None)
+    leads = result["active_users"] if result else 0
+    lead_rate = (leads / total_entered) if total_entered else 0.0
+    return goal["step_index"], leads, lead_rate
 
 
 def _resolve_update_fields(payload: FlowCategoryUpdate) -> dict[str, Any]:
@@ -166,6 +225,52 @@ def _resolve_update_fields(payload: FlowCategoryUpdate) -> dict[str, Any]:
     if payload.is_active is not None:
         updates["is_active"] = payload.is_active
     return updates
+
+
+async def _run_funnel(
+    category: FlowCategory, ga_property_id: str, ga: Any, start_date: str, end_date: str,
+    breakdown_dimension: str | None = None,
+) -> dict[str, Any]:
+    """Runs this category's ordered steps through GA4's Funnel Reports API
+    for one exact date range and folds in goal-step metrics. Shared by the
+    persisted manual /run endpoint and the dashboard's live, non-persisted
+    range query — same computation, whether or not the result gets saved."""
+    steps: list[dict[str, Any]] = [
+        {
+            "label": s.label, "match_type": s.match_type, "pattern": s.pattern,
+            "is_directly_followed": s.is_directly_followed, "within_seconds": s.within_seconds,
+        }
+        for s in category.steps
+    ]
+    result = await ga.run_funnel_report(
+        ga_property_id, steps, start_date, end_date, breakdown_dimension=breakdown_dimension,
+    )
+    goal_step_index, leads, lead_rate = _compute_goal_metrics(
+        [{"step_index": s.step_index, "is_goal": s.is_goal} for s in category.steps],
+        result["step_results"], result["total_entered"],
+    )
+    return {**result, "goal_step_index": goal_step_index, "leads": leads, "lead_rate": lead_rate}
+
+
+async def _range_stats(
+    category: FlowCategory, ga_property_id: str, ga: Any, start_date: str, end_date: str,
+) -> FlowRangeStats | None:
+    """Same live query as _run_funnel, but for the dashboard listing: a
+    failed GA4 call for one category must not break the whole page, so it's
+    logged and swallowed into None rather than raised — unlike the explicit
+    /run endpoint, nobody here asked for this exact query and is waiting on
+    its result."""
+    try:
+        result = await _run_funnel(category, ga_property_id, ga, start_date, end_date)
+    except Exception as exc:
+        logger.warning("Flows dashboard: live funnel query failed for category %s: %s", category.id, exc)
+        return None
+    return FlowRangeStats(
+        range_start=start_date, range_end=end_date,
+        step_results=result["step_results"], total_entered=result["total_entered"],
+        total_completed=result["total_completed"], conversion_rate=result["conversion_rate"],
+        goal_step_index=result["goal_step_index"], leads=result["leads"], lead_rate=result["lead_rate"],
+    )
 
 
 async def _get_category_or_404(category_id: str, db: AsyncSession) -> FlowCategory:
@@ -301,16 +406,9 @@ async def run_flow_category(
         raise HTTPException(status_code=400, detail="Connect Google Analytics for this site first")
 
     ga = AnalyticsConnector(token.access_token)
-    steps: list[dict[str, Any]] = [
-        {
-            "label": s.label, "match_type": s.match_type, "pattern": s.pattern,
-            "is_directly_followed": s.is_directly_followed, "within_seconds": s.within_seconds,
-        }
-        for s in category.steps
-    ]
     try:
-        result = await ga.run_funnel_report(
-            cfg.ga_property_id, steps, payload.start_date, payload.end_date,
+        result = await _run_funnel(
+            category, cfg.ga_property_id, ga, payload.start_date, payload.end_date,
             breakdown_dimension=payload.breakdown_dimension,
         )
     except Exception as exc:
@@ -321,6 +419,7 @@ async def run_flow_category(
         range_start=payload.start_date, range_end=payload.end_date,
         step_results=result["step_results"], total_entered=result["total_entered"],
         total_completed=result["total_completed"], conversion_rate=result["conversion_rate"],
+        goal_step_index=result["goal_step_index"], leads=result["leads"], lead_rate=result["lead_rate"],
         breakdown_dimension=payload.breakdown_dimension, breakdown=result["breakdown"],
     )
     db.add(snapshot)
@@ -343,22 +442,61 @@ async def list_flow_snapshots(
     return [FlowSnapshotResponse.model_validate(s) for s in snapshots]
 
 
-@router.get("/dashboard", response_model=list[FlowDashboardItem])
+@router.get("/dashboard", response_model=FlowDashboardResponse)
 async def get_flows_dashboard(
-    site_id: str, trend_days: int = Query(30, ge=1, le=180), db: AsyncSession = Depends(get_db),
-) -> list[FlowDashboardItem]:
-    """One card per flow category: its latest result plus a daily trend
-    series. `trend_days` bounds each category to its own single query — the
-    number of flow categories on a site is small (low tens at most), so
-    this isn't worth collapsing into one mega-join."""
+    site_id: str,
+    range: str = "7d",
+    start_date: str | None = None,
+    end_date: str | None = None,
+    compare: bool = False,
+    trend_days: int = Query(30, ge=1, le=180),
+    db: AsyncSession = Depends(get_db),
+) -> FlowDashboardResponse:
+    """One card per flow category: a LIVE funnel result for the globally
+    selected date range — same GA4-style presets as Live Visitors
+    (today/yesterday/7d/28d/90d/qtd/ytd/custom), default last 7 days — plus,
+    when `compare` is set, the same query for the immediately preceding
+    period of equal length. Each category is its own GA4 call; the number
+    of flow categories on a site is small (low tens at most), so this isn't
+    worth collapsing into one mega-query — mirrors FlowClassifier's own
+    per-category iteration.
+
+    The `trend` sparkline is unrelated to the picker: it's always built
+    from stored nightly snapshots, giving historical context regardless of
+    whatever range is currently selected.
+    """
+    range_start, range_end = resolve_date_range(range, start_date, end_date)
+    prev_start, prev_end = previous_period(range_start, range_end) if compare else (None, None)
+
     result = await db.execute(
         select(FlowCategory).options(selectinload(FlowCategory.steps))
         .where(FlowCategory.site_id == site_id).order_by(FlowCategory.created_at)
     )
     categories = result.scalars().all()
 
+    cfg_r = await db.execute(select(SiteConfig).where(SiteConfig.site_id == site_id))
+    cfg = cfg_r.scalar_one_or_none()
+
+    ga = None
+    if cfg and cfg.ga_property_id:
+        from app.api.auth import get_google_token
+        from app.connectors.analytics import AnalyticsConnector
+
+        token = await get_google_token(db)
+        if token:
+            ga = AnalyticsConnector(token.access_token)
+
     items: list[FlowDashboardItem] = []
     for category in categories:
+        current = (
+            await _range_stats(category, cfg.ga_property_id, ga, range_start, range_end)
+            if ga and category.steps else None
+        )
+        previous = (
+            await _range_stats(category, cfg.ga_property_id, ga, prev_start, prev_end)
+            if compare and ga and category.steps else None
+        )
+
         snap_r = await db.execute(
             select(FlowCategorySnapshot)
             .where(
@@ -372,10 +510,16 @@ async def get_flows_dashboard(
             .limit(trend_days)
         )
         daily = list(reversed(snap_r.scalars().all()))
-        latest = daily[-1] if daily else None
+
         items.append(FlowDashboardItem(
             category=_serialize_category(category),
-            latest=FlowSnapshotResponse.model_validate(latest) if latest else None,
+            current=current,
+            previous=previous,
             trend=[FlowSnapshotResponse.model_validate(s) for s in daily],
         ))
-    return items
+
+    return FlowDashboardResponse(
+        range_start=range_start, range_end=range_end,
+        previous_range_start=prev_start, previous_range_end=prev_end,
+        items=items,
+    )

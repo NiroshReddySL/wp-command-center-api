@@ -75,6 +75,59 @@ class SearchConsoleConnector:
             for row in data.get("rows", [])
         ]
 
+    async def get_daily_search_metrics(
+        self, site_url: str, days: int = 90
+    ) -> list[dict[str, Any]]:
+        """Day-by-day organic search performance, in ONE call.
+
+        Returns [{date: "YYYY-MM-DD", clicks, impressions, ctr, position}, ...]
+        oldest first. This is the leading indicator GA4 alone can't give:
+        impressions move BEFORE clicks do, so a ranking slide or a demand
+        shift is visible days before it shows up as lost pageviews — and
+        splitting traffic into impressions x CTR makes a drop attributable
+        (lost rankings/demand vs. a SERP or snippet change) instead of just
+        visible.
+
+        GSC finalizes data ~2-3 days late, so the most recent days are
+        simply absent from the response rather than zero — callers must not
+        read a missing day as "no traffic".
+        """
+        end = datetime.now(timezone.utc).date()
+        start = end - timedelta(days=days)
+
+        body = {
+            "startDate": str(start),
+            "endDate": str(end),
+            "dimensions": ["date"],
+            # One row per day; comfortably above any `days` we'd request.
+            "rowLimit": 500,
+        }
+
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            resp = await client.post(
+                f"{_GSC_BASE}/sites/{_encode_site(site_url)}/searchAnalytics/query",
+                headers=self._headers(),
+                json=body,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+
+        return sorted(
+            (
+                {
+                    # GSC already returns ISO dates here — no reformatting
+                    # needed (unlike GA4's "20260715" form).
+                    "date": row["keys"][0],
+                    "clicks": int(row.get("clicks", 0)),
+                    "impressions": int(row.get("impressions", 0)),
+                    "ctr": round(row.get("ctr", 0) * 100, 2),
+                    "position": round(row.get("position", 0), 1),
+                }
+                for row in data.get("rows", [])
+            ),
+            key=lambda r: r["date"],
+        )
+
     async def get_page_queries(
         self, site_url: str, page_url: str, days: int = 90
     ) -> list[dict[str, Any]]:
