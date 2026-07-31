@@ -64,6 +64,9 @@ class TestChangePct:
 
     def test_zero_previous_value_reports_no_comparison(self) -> None:
         pct, has_comparison = _change_pct(100, 0)
+        # A zero baseline can't yield a percentage — it must report a neutral
+        # 0.0 rather than a division-by-zero artefact.
+        assert pct == 0.0
         assert has_comparison is False
 
 

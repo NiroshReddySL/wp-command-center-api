@@ -10,12 +10,12 @@ attributable "submitted" conversion count.
 import re
 
 from app.api.optimizer import (
+    _ctr_opportunity,
     _detect_confirmation_page,
     _detect_conversion_targets,
+    _device_shares,
     _fill_daily_gaps,
     _page_location_regex,
-    _ctr_opportunity,
-    _device_shares,
     _pct_change,
     _rate_metric,
     _rate_speed_score,

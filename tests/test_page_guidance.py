@@ -20,15 +20,15 @@ QUERIES = [
 
 
 def _prompt(**over):
-    base = dict(
-        title="Manage and Delete Photos in OneDrive",
-        url="https://example.com/onedrive/",
-        content_html="<h2>Why Manage OneDrive?</h2><p>Some body copy about storage.</p>",
-        meta_description="An existing meta description.",
-        metrics={"Search clicks (28d)": 99, "Avg position": 6.7},
-        queries=QUERIES,
-        known_findings=["Ranking well, rarely clicked — 0.42% CTR at position 6.7"],
-    )
+    base = {
+        "title": "Manage and Delete Photos in OneDrive",
+        "url": "https://example.com/onedrive/",
+        "content_html": "<h2>Why Manage OneDrive?</h2><p>Some body copy about storage.</p>",
+        "meta_description": "An existing meta description.",
+        "metrics": {"Search clicks (28d)": 99, "Avg position": 6.7},
+        "queries": QUERIES,
+        "known_findings": ["Ranking well, rarely clicked — 0.42% CTR at position 6.7"],
+    }
     base.update(over)
     return build_guidance_prompt(**base)
 

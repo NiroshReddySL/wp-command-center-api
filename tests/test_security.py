@@ -3,12 +3,12 @@ import pytest
 from fastapi import HTTPException
 
 from app.security.auth import (
+    _decode_token,
     create_access_token,
     create_state_token,
     hash_password,
     verify_password,
     verify_state_token,
-    _decode_token,
 )
 from app.security.crypto import decrypt_value, encrypt_value
 from app.security.url_guard import _is_public_address, ensure_public_url

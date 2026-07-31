@@ -1,5 +1,5 @@
 """Traffic agent API — snapshots, trends, alerts, flush/re-run."""
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from fastapi import APIRouter, BackgroundTasks, Depends, Query
@@ -187,9 +187,9 @@ async def traffic_summary(
     db: AsyncSession = Depends(get_db),
 ) -> list[dict[str, Any]]:
     """Per-site summary: today vs yesterday, top pages."""
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    yesterday = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%d")
-    day_before = (datetime.now(timezone.utc) - timedelta(days=2)).strftime("%Y-%m-%d")
+    today = datetime.now(UTC).strftime("%Y-%m-%d")
+    yesterday = (datetime.now(UTC) - timedelta(days=1)).strftime("%Y-%m-%d")
+    day_before = (datetime.now(UTC) - timedelta(days=2)).strftime("%Y-%m-%d")
 
     sites_q = select(Site).where(Site.status != "inactive")
     if site_id:
@@ -438,7 +438,7 @@ async def get_predictions(
             results.append({
                 "site_id": site.id, "site_name": site.name,
                 "horizon_days": horizon_days,
-                "generated_at": datetime.now(timezone.utc),
+                "generated_at": datetime.now(UTC),
                 "daily_forecasts": [], "anomalies": [],
                 "narrative": "", "model_version": "gpt-4o",
                 "insufficient_data": False, "generation_failed": True,
@@ -448,7 +448,7 @@ async def get_predictions(
             results.append({
                 "site_id": site.id, "site_name": site.name,
                 "horizon_days": horizon_days,
-                "generated_at": datetime.now(timezone.utc),
+                "generated_at": datetime.now(UTC),
                 "daily_forecasts": [], "anomalies": [],
                 "narrative": "", "model_version": "gpt-4o",
                 "insufficient_data": True,

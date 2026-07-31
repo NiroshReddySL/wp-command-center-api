@@ -1,5 +1,5 @@
 """Google OAuth2 flow — connect GA + GSC."""
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from urllib.parse import urlencode
 
@@ -21,12 +21,13 @@ _AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 _TOKEN_URL = "https://oauth2.googleapis.com/token"
 
 # Scopes needed: GA4 readonly + Search Console readonly
-_SCOPES = " ".join([
+_SCOPE_LIST = (
     "https://www.googleapis.com/auth/analytics.readonly",
     "https://www.googleapis.com/auth/webmasters.readonly",
     "openid",
     "email",
-])
+)
+_SCOPES = " ".join(_SCOPE_LIST)
 
 
 class GoogleStatus(BaseModel):
@@ -102,7 +103,7 @@ async def google_callback(
     refresh_token: str = token_data.get("refresh_token", "")
     expires_in: int = token_data.get("expires_in", 3600)
     scope: str = token_data.get("scope", "")
-    expiry = datetime.now(timezone.utc) + timedelta(seconds=expires_in - 60)
+    expiry = datetime.now(UTC) + timedelta(seconds=expires_in - 60)
 
     if not refresh_token:
         return RedirectResponse(
@@ -191,7 +192,7 @@ async def google_refresh(db: AsyncSession = Depends(get_db)) -> dict[str, str]:
 
     data = resp.json()
     token.access_token = data["access_token"]
-    token.token_expiry = datetime.now(timezone.utc) + timedelta(seconds=data.get("expires_in", 3600) - 60)
+    token.token_expiry = datetime.now(UTC) + timedelta(seconds=data.get("expires_in", 3600) - 60)
     await db.flush()
     return {"status": "refreshed", "message": "Google connection refreshed."}
 
@@ -204,7 +205,7 @@ async def get_google_token(db: AsyncSession) -> OAuthToken | None:
         return None
 
     # Refresh if expired or expiring in < 5 minutes
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     if token.token_expiry and token.token_expiry <= now + timedelta(minutes=5):
         async with httpx.AsyncClient() as client:
             resp = await client.post(

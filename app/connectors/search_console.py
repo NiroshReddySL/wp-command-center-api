@@ -1,5 +1,5 @@
 """Google Search Console API connector."""
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import httpx
@@ -44,7 +44,7 @@ class SearchConsoleConnector:
         Fetch top queries with clicks, impressions, CTR, and avg position.
         Returns list of { query, clicks, impressions, ctr, position }.
         """
-        end = datetime.now(timezone.utc).date()
+        end = datetime.now(UTC).date()
         start = end - timedelta(days=days)
 
         body = {
@@ -92,7 +92,7 @@ class SearchConsoleConnector:
         simply absent from the response rather than zero — callers must not
         read a missing day as "no traffic".
         """
-        end = datetime.now(timezone.utc).date()
+        end = datetime.now(UTC).date()
         start = end - timedelta(days=days)
 
         body = {
@@ -223,7 +223,7 @@ class SearchConsoleConnector:
         self, site_url: str, page_url: str, days: int = 90
     ) -> list[dict[str, Any]]:
         """Fetch queries for a specific page."""
-        end = datetime.now(timezone.utc).date()
+        end = datetime.now(UTC).date()
         start = end - timedelta(days=days)
 
         body = {

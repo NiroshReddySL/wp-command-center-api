@@ -7,7 +7,7 @@ Bearer` header, or — for EventSource/SSE endpoints, which cannot set headers
 """
 import logging
 import secrets
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 import bcrypt
 from fastapi import Depends, HTTPException, Query, Request
@@ -41,7 +41,7 @@ def verify_password(password: str, password_hash: str) -> bool:
 # ── Tokens ────────────────────────────────────────────────────────────────────
 
 def create_access_token(user_id: str, role: str) -> str:
-    expires = datetime.now(timezone.utc) + timedelta(hours=settings.JWT_EXPIRY_HOURS)
+    expires = datetime.now(UTC) + timedelta(hours=settings.JWT_EXPIRY_HOURS)
     payload = {"sub": user_id, "role": role, "type": "access", "exp": expires}
     return jwt.encode(payload, settings.SECRET_KEY, algorithm=_ALGORITHM)
 
@@ -54,7 +54,7 @@ def _decode_token(token: str) -> dict:
 
 def create_state_token() -> str:
     """Short-lived signed nonce binding an OAuth callback to this app."""
-    expires = datetime.now(timezone.utc) + timedelta(minutes=10)
+    expires = datetime.now(UTC) + timedelta(minutes=10)
     payload = {"nonce": secrets.token_urlsafe(16), "type": "oauth_state", "exp": expires}
     return jwt.encode(payload, settings.SECRET_KEY, algorithm=_ALGORITHM)
 
@@ -89,7 +89,7 @@ async def require_user(
     try:
         payload = _decode_token(token)
     except JWTError:
-        raise HTTPException(status_code=401, detail="Invalid or expired token")
+        raise HTTPException(status_code=401, detail="Invalid or expired token") from None
 
     if payload.get("type") != "access" or not payload.get("sub"):
         raise HTTPException(status_code=401, detail="Invalid or expired token")

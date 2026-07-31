@@ -8,7 +8,7 @@ request context entirely.
 import asyncio
 import importlib
 import logging
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from sqlalchemy import select
 
@@ -49,7 +49,7 @@ AGENT_TIMEOUTS: dict[str, int] = {
 
 
 def _now() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 async def _safe_rollback(db) -> None:
@@ -119,7 +119,7 @@ async def execute_job(job_id: str) -> None:
                     alerts = await asyncio.wait_for(agent.run(job.site_id), timeout=timeout)
                     alerts_count = len(alerts)
                     logger.info("Job %s step %s done — %d alerts", job_id, class_name, alerts_count)
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     # Cancellation can land mid-flush — the session MUST be
                     # rolled back before the step result is written, or the
                     # whole job dies on the next commit.

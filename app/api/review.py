@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -91,7 +91,7 @@ async def approve_item(
     item, site_name = row
     item.status = "approved"
     item.reviewer_notes = body.reviewer_notes
-    item.reviewed_at = datetime.now(timezone.utc)
+    item.reviewed_at = datetime.now(UTC)
     await db.flush()
 
     return {
@@ -127,7 +127,7 @@ async def reject_item(
     item, site_name = row
     item.status = "rejected"
     item.reviewer_notes = body.reviewer_notes
-    item.reviewed_at = datetime.now(timezone.utc)
+    item.reviewed_at = datetime.now(UTC)
     await db.flush()
 
     return {

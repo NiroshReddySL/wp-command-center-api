@@ -15,7 +15,7 @@ import html as _html
 import io
 import logging
 import re
-from datetime import date, datetime, timedelta, timezone
+from datetime import UTC, date, datetime, timedelta
 from typing import Any
 from urllib.parse import urlparse
 
@@ -56,7 +56,7 @@ def _normalize(raw: str, site_url: str) -> tuple[str, str]:
     if not raw:
         raise ValueError("Empty URL")
 
-    if raw.startswith("http://") or raw.startswith("https://"):
+    if raw.startswith(("http://", "https://")):
         parsed = urlparse(raw)
         site_host = urlparse(site_url).hostname
         if parsed.hostname != site_host:
@@ -237,7 +237,7 @@ async def _add_urls(site: Site, raw_urls: list[str], source: str, db: AsyncSessi
     titles = await _bulk_resolve_titles([path for _, path in to_add], site, db)
 
     added: list[WatchedUrl] = []
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     for full_url, path in to_add:
         title = titles.get(path)
         watched = WatchedUrl(
@@ -368,7 +368,7 @@ async def list_watched_urls(
     missing = [w.path for w in rows if not w.title]
     if missing:
         resolved = await _bulk_resolve_titles(missing, site, db)
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         for w in rows:
             if not w.title and resolved.get(w.path):
                 w.title = resolved[w.path]

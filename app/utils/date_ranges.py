@@ -5,7 +5,7 @@ lived only in watched_urls.py; pulled out once Flow Categories needed the
 same presets plus a "previous period" for comparison.
 """
 import re
-from datetime import date, datetime, timedelta, timezone
+from datetime import UTC, date, datetime, timedelta
 
 from fastapi import HTTPException
 
@@ -34,7 +34,7 @@ def resolve_date_range(range_key: str, start_date: str | None, end_date: str | N
             detail=f"Unknown range '{range_key}' — expected one of {', '.join(sorted(RANGE_KEYS))}",
         )
 
-    today = datetime.now(timezone.utc).date()
+    today = datetime.now(UTC).date()
     if range_key == "today":
         start = today
     elif range_key == "yesterday":

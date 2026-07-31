@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from fastapi import APIRouter, Depends
@@ -51,7 +51,7 @@ class AgentSummary(BaseModel):
 
 @router.get("/metrics", response_model=DashboardMetrics)
 async def get_metrics(db: AsyncSession = Depends(get_db)) -> dict[str, Any]:
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     week_ago = now - timedelta(days=7)
     two_weeks_ago = now - timedelta(days=14)
 
@@ -233,8 +233,8 @@ async def get_traffic_overview(db: AsyncSession = Depends(get_db)) -> list[dict[
     Otherwise returns per-site totals from content_posts.
     """
     from app.api.auth import get_google_token
-    from app.database.models import SiteConfig
     from app.connectors.analytics import AnalyticsConnector
+    from app.database.models import SiteConfig
 
     token = await get_google_token(db)
     sites_result = await db.execute(select(Site))

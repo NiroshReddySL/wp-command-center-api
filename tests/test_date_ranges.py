@@ -3,7 +3,7 @@ Flow Categories' date pickers, so every preset (today/yesterday/7d/28d/90d/
 qtd/ytd/custom) resolves identically wherever it's offered, and the
 "compare to previous period" window is always computed the same way.
 """
-from datetime import date, datetime, timedelta, timezone
+from datetime import UTC, date, datetime, timedelta
 
 import pytest
 from fastapi import HTTPException
@@ -19,15 +19,15 @@ class TestResolveDateRange:
     flaky hardcoded-date test."""
 
     def test_today_preset(self) -> None:
-        today = datetime.now(timezone.utc).date().isoformat()
+        today = datetime.now(UTC).date().isoformat()
         assert resolve_date_range("today", None, None) == (today, today)
 
     def test_yesterday_preset(self) -> None:
-        yesterday = (datetime.now(timezone.utc).date() - timedelta(days=1)).isoformat()
+        yesterday = (datetime.now(UTC).date() - timedelta(days=1)).isoformat()
         assert resolve_date_range("yesterday", None, None) == (yesterday, yesterday)
 
     def test_7d_preset_spans_exactly_7_calendar_days_inclusive_of_today(self) -> None:
-        today = datetime.now(timezone.utc).date()
+        today = datetime.now(UTC).date()
         start, end = resolve_date_range("7d", None, None)
         assert end == today.isoformat()
         assert start == (today - timedelta(days=6)).isoformat()
@@ -42,7 +42,7 @@ class TestResolveDateRange:
         assert (date.fromisoformat(end) - date.fromisoformat(start)).days == 89
 
     def test_qtd_starts_on_the_first_of_the_current_quarter(self) -> None:
-        today = datetime.now(timezone.utc).date()
+        today = datetime.now(UTC).date()
         start, end = resolve_date_range("qtd", None, None)
         assert end == today.isoformat()
         assert date.fromisoformat(start) == quarter_start(today)
@@ -50,7 +50,7 @@ class TestResolveDateRange:
         assert date.fromisoformat(start).day == 1
 
     def test_ytd_starts_on_january_first(self) -> None:
-        today = datetime.now(timezone.utc).date()
+        today = datetime.now(UTC).date()
         start, end = resolve_date_range("ytd", None, None)
         assert end == today.isoformat()
         assert start == date(today.year, 1, 1).isoformat()

@@ -1,6 +1,6 @@
 import asyncio
 import logging
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -181,7 +181,7 @@ async def approve_variant(variant_id: str, db: AsyncSession = Depends(get_db)) -
     review_item = ri_result.scalar_one_or_none()
     if review_item:
         review_item.status = "approved"
-        review_item.reviewed_at = datetime.now(timezone.utc)
+        review_item.reviewed_at = datetime.now(UTC)
 
     await db.flush()
     return {"status": "approved", "variant_id": variant_id}

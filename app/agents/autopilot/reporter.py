@@ -1,5 +1,5 @@
 """Reporter — generates weekly site performance reports."""
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import select
 
@@ -15,7 +15,7 @@ class Reporter(BaseAgent):
         if not site:
             return []
 
-        week_ago = datetime.now(timezone.utc) - timedelta(days=7)
+        week_ago = datetime.now(UTC) - timedelta(days=7)
 
         alerts_result = await self.db.execute(
             select(Alert)
@@ -64,7 +64,7 @@ class Reporter(BaseAgent):
             agent="autopilot",
             action_type="weekly_report",
             payload={
-                "title": f"Weekly Report — {site.name} — {datetime.now(timezone.utc).strftime('%b %d, %Y')}",
+                "title": f"Weekly Report — {site.name} — {datetime.now(UTC).strftime('%b %d, %Y')}",
                 "type": "weekly",
                 "narrative": narrative,
                 "stats": {

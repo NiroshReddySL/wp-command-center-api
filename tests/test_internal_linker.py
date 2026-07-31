@@ -28,9 +28,9 @@ from app.agents.optimizer.internal_linker import (
     _pair_score,
     _phrase_in_text,
     _pick_query_anchor,
+    _resolve_link,
     _sentences,
     _trim_weak_edges,
-    _resolve_link,
 )
 
 
@@ -257,6 +257,7 @@ class TestResolveLink:
         assert result is not None
         source, target, anchor, anchor_source, query_match = result
         assert source is outlook_to_gmail
+        assert target is gmail_to_outlook  # direction preserved, not flipped
         assert anchor_source == "source_text"
         assert query_match is None
         assert _phrase_in_text(anchor, source_texts["a"])
@@ -291,6 +292,8 @@ class TestResolveLink:
         source, target, anchor, anchor_source, _ = result
         assert source is post_y
         assert target is post_x
+        # No queries were supplied, so the anchor can only have come from y's text.
+        assert anchor_source == "source_text"
         assert "migration" in anchor.lower() or "sharepoint" in anchor.lower()
 
     def test_returns_none_when_neither_direction_has_a_verifiable_anchor(self) -> None:

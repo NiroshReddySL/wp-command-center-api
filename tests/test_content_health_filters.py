@@ -42,7 +42,7 @@ class TestHealthStatusBounds:
 
     def test_bounds_are_contiguous_and_non_overlapping(self) -> None:
         # Every integer 0-100 must fall into exactly one bucket.
-        for score in range(0, 101):
+        for score in range(101):
             buckets_matched = []
             for status in ("healthy", "needs_work", "poor"):
                 lo, hi = _health_status_bounds(status)

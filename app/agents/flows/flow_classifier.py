@@ -5,7 +5,7 @@ time (GA4 itself has no concept of "yesterday's funnel result" persisted
 anywhere — every query is a fresh, on-demand computation).
 """
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
@@ -76,7 +76,7 @@ class FlowClassifier(BaseAgent):
             return alerts
 
         ga = AnalyticsConnector(token.access_token)
-        yesterday = (datetime.now(timezone.utc) - timedelta(days=1)).date().isoformat()
+        yesterday = (datetime.now(UTC) - timedelta(days=1)).date().isoformat()
 
         for category in categories:
             steps = _step_specs(category)

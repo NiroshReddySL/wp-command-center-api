@@ -5,7 +5,7 @@ import html as _html
 import json
 import logging
 import re
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from urllib.parse import urlparse
 
 import httpx
@@ -263,7 +263,7 @@ def _analyze(
 
     # Also count Open Graph / schema images as a signal (not as inline count)
     og_images = schema.get("og_image") or []
-    has_og_image = bool(og_images) if isinstance(og_images, list) else bool(og_images)
+    has_og_image = bool(og_images)
 
     total_images = inline_count + (1 if has_featured else 0)
 
@@ -333,7 +333,7 @@ def _analyze(
     if modified_str:
         try:
             mod_dt = datetime.fromisoformat(modified_str.replace("Z", "+00:00"))
-            age_days = (datetime.now(timezone.utc) - mod_dt).days
+            age_days = (datetime.now(UTC) - mod_dt).days
             if age_days <= 180:
                 fresh_score, fresh_status = 25, "good"
                 fresh_detail = f"Updated {age_days} days ago"
@@ -496,7 +496,7 @@ def _analyze(
         try:
             pub_dt = datetime.fromisoformat(pub_str.replace("Z", "+00:00"))
             mod_dt = datetime.fromisoformat(modified_str.replace("Z", "+00:00"))
-            pub_age_days = (datetime.now(timezone.utc) - pub_dt).days
+            pub_age_days = (datetime.now(UTC) - pub_dt).days
             never_updated = abs((mod_dt - pub_dt).total_seconds()) < 86400  # same day = never updated
             if never_updated and pub_age_days > 365:
                 issues.append(
@@ -834,7 +834,7 @@ def _analysis_priority_key(last_analyzed_at: datetime | None) -> tuple:
     however WordPress happened to return them, and pages could go
     unanalyzed run after run — exactly the bug this fixes."""
     if last_analyzed_at is None:
-        return (0, datetime.min.replace(tzinfo=timezone.utc))
+        return (0, datetime.min.replace(tzinfo=UTC))
     return (1, last_analyzed_at)
 
 
@@ -973,11 +973,11 @@ class ContentScorer(BaseAgent):
             async with _sem:
                 try:
                     return await asyncio.wait_for(_fetch_page_signals(url), timeout=6)
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     return _empty_signals()
 
         live_results = await asyncio.gather(*[_bounded_fetch(u) for u in needs_live_fetch])
-        live_by_url: dict[str, dict] = dict(zip(needs_live_fetch, live_results))
+        live_by_url: dict[str, dict] = dict(zip(needs_live_fetch, live_results, strict=True))
 
         # ── Pass 2: rule-based scoring for this batch, committing every
         # CONTENT_COMMIT_EVERY items — a mid-run timeout or crash then only
@@ -1016,7 +1016,7 @@ class ContentScorer(BaseAgent):
                 post.word_count = word_count
                 post.reading_time_minutes = reading_time
                 post.score_breakdown = breakdown
-                post.last_analyzed_at = datetime.now(timezone.utc)
+                post.last_analyzed_at = datetime.now(UTC)
                 post.wp_modified_at = _wp_modified(wp_item)
 
                 # Replace this post's existing alert (if any) — every other
@@ -1135,10 +1135,11 @@ class ContentScorer(BaseAgent):
 
         # Populate traffic_30d from GA if connected
         try:
+            from urllib.parse import urlparse as _urlparse
+
             from app.api.auth import get_google_token
             from app.connectors.analytics import AnalyticsConnector
             from app.database.models import SiteConfig
-            from urllib.parse import urlparse as _urlparse
 
             token = await get_google_token(self.db)
             if token:

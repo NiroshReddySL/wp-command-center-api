@@ -13,7 +13,7 @@ site large enough to blow the timeout. Two pure pieces fix this:
     much work one run attempts, never-analyzed items always sort first —
     so a big backlog of one content type can't starve the other forever.
 """
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from app.agents.optimizer.content_scorer import _analysis_priority_key, _interleave
 
@@ -49,18 +49,18 @@ class TestInterleave:
 
 class TestAnalysisPriorityKey:
     def test_never_analyzed_sorts_before_analyzed(self) -> None:
-        analyzed = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        analyzed = datetime(2026, 1, 1, tzinfo=UTC)
         assert _analysis_priority_key(None) < _analysis_priority_key(analyzed)
 
     def test_older_analysis_sorts_before_newer(self) -> None:
-        older = datetime(2026, 1, 1, tzinfo=timezone.utc)
-        newer = datetime(2026, 6, 1, tzinfo=timezone.utc)
+        older = datetime(2026, 1, 1, tzinfo=UTC)
+        newer = datetime(2026, 6, 1, tzinfo=UTC)
         assert _analysis_priority_key(older) < _analysis_priority_key(newer)
 
     def test_sorting_a_mixed_list_puts_never_analyzed_first_oldest_next(self) -> None:
         never = None
-        old = datetime(2026, 1, 1, tzinfo=timezone.utc)
-        recent = datetime(2026, 6, 1, tzinfo=timezone.utc)
+        old = datetime(2026, 1, 1, tzinfo=UTC)
+        recent = datetime(2026, 6, 1, tzinfo=UTC)
         items = [("recent", recent), ("never", never), ("old", old)]
         ordered = sorted(items, key=lambda pair: _analysis_priority_key(pair[1]))
         assert [name for name, _ in ordered] == ["never", "old", "recent"]

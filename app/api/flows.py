@@ -21,7 +21,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.database.engine import get_db
-from app.database.models import FlowCategory, FlowCategorySnapshot, FlowCategoryStep, Site, SiteConfig
+from app.database.models import (
+    FlowCategory,
+    FlowCategorySnapshot,
+    FlowCategoryStep,
+    Site,
+    SiteConfig,
+)
 from app.security.rate_limit import ai_limiter, job_limiter
 from app.utils.date_ranges import previous_period, resolve_date_range
 

@@ -189,8 +189,9 @@ EXTRA_DDL: list[str] = [
 
 
 async def init_db() -> None:
-    from app.database import models  # noqa: F401 — ensure models are imported
     from sqlalchemy import text
+
+    from app.database import models  # noqa: F401 — ensure models are imported
 
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)

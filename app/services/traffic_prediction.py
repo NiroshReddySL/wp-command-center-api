@@ -1,6 +1,6 @@
 """Traffic Prediction Service — caches GPT-4o forecasts in the traffic_predictions table."""
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from sqlalchemy import delete, select
@@ -111,11 +111,11 @@ class TrafficPredictionService:
         latest = await self._fetch_latest(site_id, horizon_days)
         if latest is None:
             return None
-        cutoff = datetime.now(timezone.utc) - timedelta(hours=CACHE_TTL_HOURS)
+        cutoff = datetime.now(UTC) - timedelta(hours=CACHE_TTL_HOURS)
         return latest if latest.generated_at >= cutoff else None
 
     async def _fetch_history(self, site_id: str) -> list[TrafficSnapshot]:
-        since = (datetime.now(timezone.utc) - timedelta(days=HISTORY_DAYS)).strftime("%Y-%m-%d")
+        since = (datetime.now(UTC) - timedelta(days=HISTORY_DAYS)).strftime("%Y-%m-%d")
         result = await self.db.execute(
             select(TrafficSnapshot)
             .where(TrafficSnapshot.site_id == site_id, TrafficSnapshot.date >= since)
@@ -165,7 +165,7 @@ class TrafficPredictionService:
 
     def _validate_forecasts(self, forecasts: list[dict], horizon_days: int) -> list[dict]:
         """Re-index forecast dates to be consecutive from tomorrow, in case GPT drifts."""
-        base_date = datetime.now(timezone.utc).date() + timedelta(days=1)
+        base_date = datetime.now(UTC).date() + timedelta(days=1)
         validated = []
         for i in range(horizon_days):
             expected_date = (base_date + timedelta(days=i)).isoformat()

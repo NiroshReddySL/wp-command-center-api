@@ -77,7 +77,7 @@ async def receive_webhook(
     try:
         payload = json.loads(raw_body)
     except json.JSONDecodeError:
-        raise HTTPException(status_code=400, detail="Invalid JSON body")
+        raise HTTPException(status_code=400, detail="Invalid JSON body") from None
 
     event = payload.get("event", "")
     site_url = payload.get("site_url", "")

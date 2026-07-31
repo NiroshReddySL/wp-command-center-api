@@ -1,11 +1,12 @@
 import logging
 from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from app.api.router import router
 from app.config import settings
 from app.database.engine import init_db
-from app.api.router import router
 from app.services.scheduler import scheduler, setup_scheduler
 
 logging.basicConfig(
@@ -57,6 +58,7 @@ async def ready() -> dict[str, str]:
     """Readiness probe — verifies the database is reachable."""
     from fastapi import HTTPException
     from sqlalchemy import text
+
     from app.database.engine import engine
 
     try:

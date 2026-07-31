@@ -1,7 +1,7 @@
 import asyncio
 import logging
 import re
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from urllib.parse import urlparse
 
@@ -814,7 +814,7 @@ async def get_content_search_console(
     if not token or not gsc_url:
         return {"connected": False}
 
-    end = datetime.now(timezone.utc).date() - timedelta(days=_GSC_LAG_DAYS)
+    end = datetime.now(UTC).date() - timedelta(days=_GSC_LAG_DAYS)
     start = end - timedelta(days=_GSC_WINDOW_DAYS - 1)
     prev_end = start - timedelta(days=1)
     prev_start = prev_end - timedelta(days=_GSC_WINDOW_DAYS - 1)
@@ -951,7 +951,7 @@ async def get_content_post_analytics(
     if not cfg or not cfg.ga_property_id or not token:
         return {"connected": False}
 
-    today = datetime.now(timezone.utc).date()
+    today = datetime.now(UTC).date()
     range_start = (today - timedelta(days=29)).isoformat()
     range_end = today.isoformat()
     prev_start = (today - timedelta(days=59)).isoformat()
@@ -1064,7 +1064,6 @@ async def rescan_content_post(
     db: AsyncSession = Depends(get_db),
 ) -> dict[str, Any]:
     """Re-fetch from WordPress and re-run deep analysis for a single post."""
-    from datetime import timezone
     result = await db.execute(
         select(ContentPost, Site)
         .join(Site, ContentPost.site_id == Site.id)
@@ -1078,9 +1077,14 @@ async def rescan_content_post(
     if not post.wp_post_id:
         raise HTTPException(status_code=422, detail="Post has no WordPress ID — cannot rescan")
 
-    from app.connectors.wordpress import WordPressConnector
-    from app.agents.optimizer.content_scorer import _analyze, _generate_ai_recommendation, _fetch_page_signals
     import re as _re
+
+    from app.agents.optimizer.content_scorer import (
+        _analyze,
+        _fetch_page_signals,
+        _generate_ai_recommendation,
+    )
+    from app.connectors.wordpress import WordPressConnector
 
     wp = WordPressConnector(site.url, site.api_key)
     try:
@@ -1133,7 +1137,7 @@ async def rescan_content_post(
     post.word_count = word_count
     post.reading_time_minutes = reading_time
     post.score_breakdown = breakdown
-    post.last_analyzed_at = datetime.now(timezone.utc)
+    post.last_analyzed_at = datetime.now(UTC)
 
     import hashlib
     import html as _html_lib
@@ -1307,7 +1311,7 @@ async def _collect_post_performance(post: ContentPost, db: AsyncSession) -> dict
     # ── GA4 engagement + conversions ──────────────────────────────────────
     if token and cfg and cfg.ga_property_id:
         post_path = urlparse(post.url).path
-        today = datetime.now(timezone.utc).date()
+        today = datetime.now(UTC).date()
         start, end = (today - timedelta(days=29)).isoformat(), today.isoformat()
         try:
             ga = AnalyticsConnector(token.access_token)
@@ -1346,7 +1350,7 @@ async def _collect_post_performance(post: ContentPost, db: AsyncSession) -> dict
     if token and gsc_url:
         try:
             gsc = SearchConsoleConnector(token.access_token)
-            end = datetime.now(timezone.utc).date() - timedelta(days=_GSC_LAG_DAYS)
+            end = datetime.now(UTC).date() - timedelta(days=_GSC_LAG_DAYS)
             start = end - timedelta(days=_GSC_WINDOW_DAYS - 1)
             prev_end = start - timedelta(days=1)
             prev_start = prev_end - timedelta(days=_GSC_WINDOW_DAYS - 1)
@@ -1593,7 +1597,9 @@ async def flush_optimizer(
 
 async def _run_optimizer_module(site_id: str | None, module: str) -> None:
     import logging
+
     from sqlalchemy import select as sa_select
+
     from app.database.engine import AsyncSessionLocal
     from app.database.models import Site as SiteModel
 

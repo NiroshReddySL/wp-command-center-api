@@ -1,5 +1,5 @@
 import asyncio
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
@@ -148,7 +148,7 @@ async def dismiss_alert(alert_id: str, db: AsyncSession = Depends(get_db)) -> di
     if not alert:
         raise HTTPException(status_code=404, detail="Alert not found")
     alert.status = "dismissed"
-    alert.resolved_at = datetime.now(timezone.utc)
+    alert.resolved_at = datetime.now(UTC)
     await db.flush()
     return {"status": "dismissed"}
 
@@ -167,6 +167,7 @@ TYPE_PREFIXES: dict[str, str] = {
 
 async def _run_watchdog(site_id: str | None, module: str | None) -> None:
     import logging
+
     from app.agents.watchdog.link_checker import LinkChecker
     from app.agents.watchdog.performance import PerformanceMonitor
     from app.agents.watchdog.plugin_audit import PluginAuditor

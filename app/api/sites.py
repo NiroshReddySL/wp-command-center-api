@@ -1,4 +1,3 @@
-import asyncio
 import logging
 from datetime import datetime
 from typing import Any
@@ -8,10 +7,20 @@ from pydantic import BaseModel
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.database.engine import get_db
-from app.database.models import Alert, ContentPost, PerformanceSnapshot, PluginAudit, ReviewItem, Site, SiteConfig, Variant
 from app.connectors.wordpress import WordPressConnector
+from app.database.engine import get_db
+from app.database.models import (
+    Alert,
+    ContentPost,
+    PerformanceSnapshot,
+    PluginAudit,
+    ReviewItem,
+    Site,
+    SiteConfig,
+    Variant,
+)
 from app.security.auth import require_admin
+from app.utils.background import spawn
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -303,8 +312,9 @@ async def sync_site(
     # and would otherwise race against this request's uncommitted data.
     await db.commit()
 
-    # Run agents in the background (non-blocking)
-    asyncio.create_task(_run_agents_background(site_id))
+    # Run agents in the background (non-blocking). spawn() holds the
+    # reference so it can't be collected mid-run.
+    spawn(_run_agents_background(site_id), name=f"sync-agents-{site_id}")
 
     return {
         "status": "ok",
@@ -411,8 +421,8 @@ async def get_site_content(
 
 async def _run_agents_background(site_id: str) -> None:
     """Run all agents for a site with a fresh DB session after sync completes."""
-    from app.api.agents import run_agents_for_site
     from app.agents.optimizer.site_context_analyzer import analyze_site_context
+    from app.api.agents import run_agents_for_site
     from app.database.engine import AsyncSessionLocal
 
     try:

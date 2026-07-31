@@ -5,9 +5,17 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.engine import get_db
 from app.database.models import (
-    Alert, ContentPost, OAuthToken, PerformanceSnapshot,
-    PluginAudit, ReviewItem, Site, SiteConfig,
-    TrafficPrediction, TrafficSnapshot, Variant,
+    Alert,
+    ContentPost,
+    OAuthToken,
+    PerformanceSnapshot,
+    PluginAudit,
+    ReviewItem,
+    Site,
+    SiteConfig,
+    TrafficPrediction,
+    TrafficSnapshot,
+    Variant,
 )
 
 router = APIRouter()

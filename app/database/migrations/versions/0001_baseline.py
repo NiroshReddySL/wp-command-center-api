@@ -18,8 +18,8 @@ from collections.abc import Sequence
 import sqlalchemy as sa
 from alembic import op
 
-from app.database.engine import Base, EXTRA_DDL
 from app.database import models  # noqa: F401 — register all models on Base.metadata
+from app.database.engine import EXTRA_DDL, Base
 
 revision: str = "0001_baseline"
 down_revision: str | None = None

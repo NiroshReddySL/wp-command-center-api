@@ -44,7 +44,7 @@ async def ensure_public_url(url: str) -> None:
             socket.getaddrinfo, parsed.hostname, None, proto=socket.IPPROTO_TCP
         )
     except socket.gaierror:
-        raise HTTPException(status_code=422, detail="Site URL hostname does not resolve")
+        raise HTTPException(status_code=422, detail="Site URL hostname does not resolve") from None
 
     for info in infos:
         if not _is_public_address(info[4][0]):

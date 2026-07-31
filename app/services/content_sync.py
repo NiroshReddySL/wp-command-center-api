@@ -21,7 +21,7 @@ simultaneous delete+publish that leaves the count unchanged).
 import hashlib
 import logging
 import re
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from sqlalchemy import select
@@ -147,7 +147,7 @@ async def sync_site_content(site: Site, db: AsyncSession) -> dict[str, Any]:
     deletions.
     """
     wp = WordPressConnector(site.url, site.api_key)
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     reconcile_due = (
         site.last_full_reconciled_at is None
         or now - site.last_full_reconciled_at > RECONCILE_INTERVAL

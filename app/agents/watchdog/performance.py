@@ -8,7 +8,7 @@ every 2-hour run.
 import asyncio
 import logging
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 import httpx
 from sqlalchemy import delete, select
@@ -179,7 +179,7 @@ class PerformanceMonitor(BaseAgent):
             delete(PerformanceSnapshot).where(
                 PerformanceSnapshot.site_id == site_id,
                 PerformanceSnapshot.snapshot_at
-                < datetime.now(timezone.utc) - timedelta(days=SNAPSHOT_RETENTION_DAYS),
+                < datetime.now(UTC) - timedelta(days=SNAPSHOT_RETENTION_DAYS),
             )
         )
 

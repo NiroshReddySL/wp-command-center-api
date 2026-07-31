@@ -2,20 +2,22 @@
 import asyncio
 import json
 import logging
+from collections.abc import AsyncGenerator
 from datetime import datetime
-from typing import Any, AsyncGenerator
+from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy import func, select
-from sqlalchemy.orm import selectinload
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from app.database.engine import AsyncSessionLocal, get_db
-from app.security.rate_limit import job_limiter
 from app.database.models import AgentJob, AgentJobStep, Site
+from app.security.rate_limit import job_limiter
 from app.services.job_executor import execute_job
+from app.utils.background import spawn
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -268,7 +270,7 @@ async def _stream_agents(site_id: str) -> AsyncGenerator[str, None]:
                         "alerts": alert_count,
                         "pct": round((idx + 1) / total * 100),
                     })
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     # Roll back — a cancellation mid-flush poisons the session
                     # and would kill every remaining step otherwise.
                     await db.rollback()
@@ -362,8 +364,9 @@ async def create_job(
 
     await db.commit()
 
-    # Fire detached task — never awaited, outlives this request
-    asyncio.create_task(execute_job(job.id))
+    # Fire detached task — never awaited, outlives this request. spawn()
+    # holds the reference so it can't be collected mid-run.
+    spawn(execute_job(job.id), name=f"job-{job.id}")
 
     return {"job_id": job.id, "status": "pending"}
 

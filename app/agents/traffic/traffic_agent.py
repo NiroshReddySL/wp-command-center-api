@@ -16,7 +16,7 @@ possible.
 
 import asyncio
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from sqlalchemy import select
@@ -193,7 +193,7 @@ class TrafficAgent(BaseAgent):
             existing.geo_regions = snapshot.get("geo_regions", existing.geo_regions)
             existing.geo_cities = snapshot.get("geo_cities", existing.geo_cities)
             existing.source = snapshot["source"]
-            existing.snapshot_at = datetime.now(timezone.utc)
+            existing.snapshot_at = datetime.now(UTC)
         else:
             self.db.add(TrafficSnapshot(
                 site_id=site_id,
@@ -232,7 +232,7 @@ class TrafficAgent(BaseAgent):
         _should_attempt_backfill for the actual decision."""
         from app.services.traffic_prediction import MIN_SNAPSHOTS
 
-        since = (datetime.now(timezone.utc) - timedelta(days=BACKFILL_LOOKBACK_DAYS)).strftime("%Y-%m-%d")
+        since = (datetime.now(UTC) - timedelta(days=BACKFILL_LOOKBACK_DAYS)).strftime("%Y-%m-%d")
         result = await self.db.execute(
             select(TrafficSnapshot.source)
             .where(TrafficSnapshot.site_id == site_id, TrafficSnapshot.date >= since)
@@ -307,7 +307,7 @@ class TrafficAgent(BaseAgent):
                 ga.get_geo_breakdown(cfg.ga_property_id, days=1),
             )
 
-            yesterday = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%d")
+            yesterday = (datetime.now(UTC) - timedelta(days=1)).strftime("%Y-%m-%d")
             return {
                 "date": yesterday,
                 "pageviews": metrics.get("pageviews", 0),
@@ -346,7 +346,7 @@ class TrafficAgent(BaseAgent):
         ]
 
         return {
-            "date": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+            "date": datetime.now(UTC).strftime("%Y-%m-%d"),
             "pageviews": estimated_daily,
             "sessions": int(estimated_daily * 0.75),
             "users": int(estimated_daily * 0.65),

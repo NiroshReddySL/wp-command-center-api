@@ -1,6 +1,6 @@
 """Google Analytics 4 Data API connector."""
 import re
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import httpx
@@ -22,39 +22,23 @@ _FUNNEL_MATCH_TYPES = {"contains": "CONTAINS", "exact": "EXACT", "regex": "FULL_
 # ISO 3166-1 alpha-2 → macro-region mapping
 _REGION_LOOKUP: dict[str, str] = {
     # North America
-    **{c: "North America" for c in ["US", "CA", "MX"]},
+    **dict.fromkeys(["US", "CA", "MX"], "North America"),
     # Latin America
-    **{c: "Latin America" for c in [
-        "BR", "AR", "CL", "CO", "PE", "VE", "EC", "BO", "PY", "UY",
-        "GT", "HN", "SV", "NI", "CR", "PA", "CU", "DO", "HT", "JM",
-    ]},
+    **dict.fromkeys(["BR", "AR", "CL", "CO", "PE", "VE", "EC", "BO", "PY", "UY", "GT", "HN", "SV", "NI", "CR", "PA", "CU", "DO", "HT", "JM"], "Latin America"),
     # Europe
-    **{c: "Europe" for c in [
-        "GB", "DE", "FR", "IT", "ES", "NL", "BE", "SE", "NO", "DK",
-        "FI", "PL", "CZ", "AT", "CH", "PT", "GR", "HU", "RO", "BG",
-        "HR", "SK", "SI", "LT", "LV", "EE", "IE", "LU", "MT", "CY",
-        "UA", "RS", "BA", "AL", "MK", "ME", "XK", "MD", "BY", "IS",
-    ]},
+    **dict.fromkeys(["GB", "DE", "FR", "IT", "ES", "NL", "BE", "SE", "NO", "DK", "FI", "PL", "CZ", "AT", "CH", "PT", "GR", "HU", "RO", "BG", "HR", "SK", "SI", "LT", "LV", "EE", "IE", "LU", "MT", "CY", "UA", "RS", "BA", "AL", "MK", "ME", "XK", "MD", "BY", "IS"], "Europe"),
     # Middle East
-    **{c: "Middle East" for c in [
-        "SA", "AE", "QA", "KW", "BH", "OM", "JO", "LB", "IL", "IQ",
-        "IR", "SY", "YE", "PS",
-    ]},
+    **dict.fromkeys(["SA", "AE", "QA", "KW", "BH", "OM", "JO", "LB", "IL", "IQ", "IR", "SY", "YE", "PS"], "Middle East"),
     # Africa
-    **{c: "Africa" for c in [
-        "ZA", "NG", "KE", "ET", "GH", "TZ", "UG", "MA", "EG", "DZ",
-        "TN", "SN", "CM", "CI", "MZ", "ZM", "ZW", "RW", "MG", "AO",
-    ]},
+    **dict.fromkeys(["ZA", "NG", "KE", "ET", "GH", "TZ", "UG", "MA", "EG", "DZ", "TN", "SN", "CM", "CI", "MZ", "ZM", "ZW", "RW", "MG", "AO"], "Africa"),
     # South Asia
-    **{c: "South Asia" for c in ["IN", "PK", "BD", "LK", "NP", "MV", "BT", "AF"]},
+    **dict.fromkeys(["IN", "PK", "BD", "LK", "NP", "MV", "BT", "AF"], "South Asia"),
     # Southeast Asia
-    **{c: "Southeast Asia" for c in [
-        "SG", "MY", "TH", "PH", "ID", "VN", "MM", "KH", "LA", "BN",
-    ]},
+    **dict.fromkeys(["SG", "MY", "TH", "PH", "ID", "VN", "MM", "KH", "LA", "BN"], "Southeast Asia"),
     # East Asia
-    **{c: "East Asia" for c in ["CN", "JP", "KR", "TW", "HK", "MO", "MN"]},
+    **dict.fromkeys(["CN", "JP", "KR", "TW", "HK", "MO", "MN"], "East Asia"),
     # Oceania
-    **{c: "Oceania" for c in ["AU", "NZ", "PG", "FJ", "SB", "VU", "WS", "TO"]},
+    **dict.fromkeys(["AU", "NZ", "PG", "FJ", "SB", "VU", "WS", "TO"], "Oceania"),
 }
 
 
@@ -78,7 +62,7 @@ async def _refresh_access_token(refresh_token: str) -> tuple[str, datetime]:
         data = resp.json()
         access_token: str = data["access_token"]
         expires_in: int = data.get("expires_in", 3600)
-        expiry = datetime.now(timezone.utc) + timedelta(seconds=expires_in - 60)
+        expiry = datetime.now(UTC) + timedelta(seconds=expires_in - 60)
         return access_token, expiry
 
 

@@ -14,7 +14,7 @@ This profile is stored on Site.site_context and injected into every
 per-post AI recommendation prompt so advice is personalised.
 """
 import logging
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -102,12 +102,12 @@ If something cannot be determined, use a reasonable generic value rather than le
     if not context or not isinstance(context, dict):
         return {}
 
-    context["analyzed_at"] = datetime.now(timezone.utc).isoformat()
+    context["analyzed_at"] = datetime.now(UTC).isoformat()
     context["wp_name"] = wp_name
     context["wp_tagline"] = wp_tagline
 
     site.site_context = context
-    site.site_context_analyzed_at = datetime.now(timezone.utc)
+    site.site_context_analyzed_at = datetime.now(UTC)
 
     logger.info(
         "SiteContextAnalyzer: site %s identified as %s / %s",
