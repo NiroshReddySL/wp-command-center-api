@@ -51,6 +51,7 @@ EXTRA_DDL: list[str] = [
             "ALTER TABLE sites ADD COLUMN IF NOT EXISTS last_full_reconciled_at TIMESTAMPTZ",
             "ALTER TABLE content_posts ADD COLUMN IF NOT EXISTS content_type VARCHAR(10) NOT NULL DEFAULT 'post'",
             "ALTER TABLE content_posts ADD COLUMN IF NOT EXISTS wp_modified_at TIMESTAMPTZ",
+            "ALTER TABLE content_posts ADD COLUMN IF NOT EXISTS ai_guidance JSONB",
             # Agent job tables (idempotent — safe on every boot)
             """CREATE TABLE IF NOT EXISTS agent_jobs (
                 id              VARCHAR(36) PRIMARY KEY,

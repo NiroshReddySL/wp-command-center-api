@@ -511,6 +511,47 @@ class AnalyticsConnector:
             bucket[iso_date] = bucket.get(iso_date, 0) + users
         return result
 
+    async def get_device_breakdown_by_path(
+        self, property_id: str, paths: list[str], start_date: str, end_date: str,
+    ) -> dict[str, int]:
+        """Active users per device category ("desktop" | "mobile" | "tablet")
+        for the given page paths over a date range.
+
+        Returns {device: active_users}, summed across the supplied paths. GA4
+        omits a category entirely when nobody used it, so an absent key means
+        zero rather than missing data.
+        """
+        if not property_id.startswith("properties/"):
+            property_id = f"properties/{property_id}"
+        if not paths:
+            return {}
+
+        body = {
+            "dateRanges": [{"startDate": start_date, "endDate": end_date}],
+            "dimensions": [{"name": "deviceCategory"}],
+            "metrics": [{"name": "activeUsers"}],
+            "dimensionFilter": {
+                "filter": {"fieldName": "pagePath", "inListFilter": {"values": paths}}
+            },
+            "limit": 20,
+        }
+
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            resp = await client.post(
+                f"{_GA4_URL}/{property_id}:runReport",
+                headers={"Authorization": f"Bearer {self.access_token}"},
+                json=body,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+
+        result: dict[str, int] = {}
+        for row in data.get("rows", []):
+            device = row["dimensionValues"][0]["value"]
+            users = int(row["metricValues"][0]["value"])
+            result[device] = result.get(device, 0) + users
+        return result
+
     async def get_engagement_metrics_by_path(
         self, property_id: str, paths: list[str], start_date: str, end_date: str,
     ) -> dict[str, dict[str, float]]:

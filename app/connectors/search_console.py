@@ -128,6 +128,97 @@ class SearchConsoleConnector:
             key=lambda r: r["date"],
         )
 
+    def _page_filter(self, page_url: str) -> list[dict[str, Any]]:
+        return [{"filters": [{"dimension": "page", "operator": "equals", "expression": page_url}]}]
+
+    async def _page_query(
+        self, site_url: str, page_url: str, start: str, end: str,
+        dimensions: list[str], row_limit: int = 1,
+    ) -> list[dict[str, Any]]:
+        body = {
+            "startDate": start,
+            "endDate": end,
+            "dimensions": dimensions,
+            "dimensionFilterGroups": self._page_filter(page_url),
+            "rowLimit": row_limit,
+        }
+        async with httpx.AsyncClient(timeout=25.0) as client:
+            resp = await client.post(
+                f"{_GSC_BASE}/sites/{_encode_site(site_url)}/searchAnalytics/query",
+                headers=self._headers(),
+                json=body,
+            )
+            if resp.status_code == 404:
+                return []
+            resp.raise_for_status()
+            return resp.json().get("rows", [])
+
+    async def get_page_search_summary(
+        self, site_url: str, page_url: str, start: str, end: str,
+    ) -> dict[str, float]:
+        """Totals for ONE page over an explicit date window: clicks,
+        impressions, ctr (%) and average position.
+
+        Asked of GSC with no dimensions so Google computes the aggregates
+        itself — in particular `position`, which is impression-weighted and
+        would be wrong if naively averaged from daily or per-query rows.
+        """
+        rows = await self._page_query(site_url, page_url, start, end, dimensions=[])
+        if not rows:
+            return {"clicks": 0, "impressions": 0, "ctr": 0.0, "position": 0.0}
+        m = rows[0]
+        return {
+            "clicks": int(m.get("clicks", 0)),
+            "impressions": int(m.get("impressions", 0)),
+            "ctr": round(m.get("ctr", 0) * 100, 2),
+            "position": round(m.get("position", 0), 1),
+        }
+
+    async def get_page_daily_search(
+        self, site_url: str, page_url: str, start: str, end: str,
+    ) -> list[dict[str, Any]]:
+        """Day-by-day clicks/impressions for one page, oldest first. Days
+        with no search activity are simply absent from GSC's response."""
+        rows = await self._page_query(
+            site_url, page_url, start, end, dimensions=["date"], row_limit=500,
+        )
+        return sorted(
+            (
+                {
+                    "date": r["keys"][0],
+                    "clicks": int(r.get("clicks", 0)),
+                    "impressions": int(r.get("impressions", 0)),
+                }
+                for r in rows
+            ),
+            key=lambda r: r["date"],
+        )
+
+    async def get_page_query_details(
+        self, site_url: str, page_url: str, start: str, end: str, limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """Every search query this page appeared for, with CTR and position.
+
+        Sorted by impressions here rather than relying on the API's ordering:
+        the queries worth acting on are the high-impression ones, which are
+        often the ones with zero clicks and so would sit at the bottom of a
+        clicks-ordered response.
+        """
+        rows = await self._page_query(
+            site_url, page_url, start, end, dimensions=["query"], row_limit=limit,
+        )
+        queries = [
+            {
+                "query": r["keys"][0],
+                "clicks": int(r.get("clicks", 0)),
+                "impressions": int(r.get("impressions", 0)),
+                "ctr": round(r.get("ctr", 0) * 100, 2),
+                "position": round(r.get("position", 0), 1),
+            }
+            for r in rows
+        ]
+        return sorted(queries, key=lambda q: q["impressions"], reverse=True)
+
     async def get_page_queries(
         self, site_url: str, page_url: str, days: int = 90
     ) -> list[dict[str, Any]]:

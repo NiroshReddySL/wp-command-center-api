@@ -120,6 +120,12 @@ class ContentPost(TimestampMixin, Base):
     reading_time_minutes: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     score_breakdown: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
     ai_recommendation: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Structured, research-oriented guidance from the on-demand AI pass:
+    # a diagnosis, ready-to-paste title/meta rewrites, and content gaps tied
+    # to real search queries. Kept separate from ai_recommendation so the
+    # plain-text field stays valid for consumers that render it as prose
+    # (e.g. the SEO opportunities list).
+    ai_guidance: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     # Hash of the inputs the current ai_recommendation was generated from —
     # lets the scorer skip paid AI calls when nothing changed.
     ai_rec_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)

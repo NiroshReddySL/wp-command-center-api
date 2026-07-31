@@ -616,6 +616,77 @@ def _analyze(
     return min(score, 100), issues, breakdown, word_count, reading_time
 
 
+def _performance_block(performance: dict | None) -> str:
+    """Real measured behaviour as a prompt section — traffic, search and
+    speed, each included only when that source actually has data.
+
+    Every source is optional and independent: a site with no GA4, no Search
+    Console, or no PageSpeed test still produces a valid (shorter) block, and
+    an empty one returns "" so the prompt is byte-identical to the
+    content-only version. Nothing here is ever invented — a missing metric is
+    simply an absent line, never a zero, because "0 clicks" and "we don't
+    know" would lead the model to opposite advice.
+    """
+    if not performance:
+        return ""
+
+    lines: list[str] = []
+
+    traffic_bits = []
+    if performance.get("visitors_30d") is not None:
+        traffic_bits.append(f"{performance['visitors_30d']:,} visitors/30d")
+    if performance.get("bounce_rate") is not None:
+        traffic_bits.append(f"bounce {performance['bounce_rate']:.0f}%")
+    if performance.get("avg_engagement_time") is not None:
+        traffic_bits.append(f"avg engagement {performance['avg_engagement_time']:.0f}s")
+    if traffic_bits:
+        lines.append(f"  Traffic      : {', '.join(traffic_bits)}")
+
+    if performance.get("leads") is not None:
+        lines.append(f"  Conversions  : {performance['leads']} reached the confirmation page")
+
+    search_bits = []
+    if performance.get("search_clicks") is not None:
+        search_bits.append(f"{performance['search_clicks']:,} clicks")
+    if performance.get("search_impressions") is not None:
+        search_bits.append(f"{performance['search_impressions']:,} impressions")
+    if performance.get("search_ctr") is not None:
+        search_bits.append(f"CTR {performance['search_ctr']:.2f}%")
+    if performance.get("search_position") is not None:
+        search_bits.append(f"avg position {performance['search_position']:.1f}")
+    if search_bits:
+        lines.append(f"  Google search: {', '.join(search_bits)}")
+
+    opp = performance.get("ctr_opportunity")
+    if opp:
+        lines.append(
+            f"  ** CTR GAP  : ranks {opp['position']:.1f} but earns only "
+            f"{opp['ctr']:.2f}% CTR vs ~{opp['typical_ctr']:.1f}% typical for that position. "
+            f"It already ranks — the title/meta description is what's losing the clicks."
+        )
+
+    queries = performance.get("top_queries") or []
+    if queries:
+        rendered = "; ".join(
+            f'"{q["query"]}" ({q["impressions"]:,} impressions, position {q["position"]:.1f})'
+            for q in queries[:5]
+        )
+        lines.append(f"  Real queries : {rendered}")
+
+    if performance.get("speed_score") is not None:
+        speed = f"  PageSpeed    : {performance['speed_score']}/100"
+        if performance.get("speed_strategy"):
+            speed += f" ({performance['speed_strategy']})"
+        failing = performance.get("failing_vitals") or []
+        if failing:
+            speed += f" — failing: {', '.join(failing)}"
+        lines.append(speed)
+
+    if not lines:
+        return ""
+    return "MEASURED PERFORMANCE (real data for this page — base advice on this, not assumptions):\n" + "\n".join(lines) + "\n\n"
+
+
 async def _generate_ai_recommendation(
     title: str,
     score: int,
@@ -623,6 +694,7 @@ async def _generate_ai_recommendation(
     issues: list[str],
     breakdown: dict,
     site_context: dict | None = None,
+    performance: dict | None = None,
 ) -> str | None:
     """
     Generate 3 personalised, actionable AI recommendations for the post.
@@ -638,7 +710,12 @@ async def _generate_ai_recommendation(
              inconclusive, so callers must leave any existing text alone
              rather than erase advice that may still be accurate.
     """
-    if not issues and score >= 80:
+    # A page can be structurally flawless and still be badly underperforming
+    # — ranking on page 1 while almost nobody clicks, say. Short-circuiting
+    # on content score alone would silently withhold the most valuable advice
+    # we have precisely from the pages that look fine on paper.
+    has_perf_opportunity = bool(performance and performance.get("ctr_opportunity"))
+    if not issues and score >= 80 and not has_perf_opportunity:
         return ""
     try:
         # ── Site context block ────────────────────────────────────────────
@@ -673,6 +750,8 @@ async def _generate_ai_recommendation(
             elif sm.get("faq_recommendation") == "present":
                 faq_ctx = "  FAQPage schema correctly implemented.\n"
 
+        perf_block = _performance_block(performance)
+
         prompt = (
             f"{site_ctx_block}"
             f"POST ANALYSIS:\n"
@@ -682,7 +761,9 @@ async def _generate_ai_recommendation(
             f"  Issues      : {'; '.join(issues) if issues else 'None'}\n"
             + (f"{heading_ctx}\n" if heading_ctx else "")
             + faq_ctx
-            + "\nProvide exactly 3 specific, actionable improvements for this post. "
+            + "\n"
+            + perf_block
+            + "Provide exactly 3 specific, actionable improvements for this post. "
             + (
                 f"Write them in a {site_context.get('brand_tone', 'professional')} tone, "
                 f"relevant to a {site_context.get('industry', 'WordPress')} site "
@@ -690,7 +771,18 @@ async def _generate_ai_recommendation(
                 if site_context else ""
             )
             + "Reference the actual issues above — do not give generic advice. "
-            'Respond with JSON only: {"recommendations": ["...", "...", "..."]}'
+            + (
+                # Measured behaviour beats structural heuristics: "nobody
+                # clicks this despite ranking 7th" is worth more than
+                # "add 200 words", and the real query list lets the model
+                # match the title to the words people actually search.
+                "Where MEASURED PERFORMANCE is present, lead with it — the numbers describe what is "
+                "actually happening, so prefer fixing what they show over generic content advice. "
+                "If real queries are listed, use their exact wording to suggest title/heading changes. "
+                "Cite the specific number you are acting on in each recommendation. "
+                if perf_block else ""
+            )
+            + 'Respond with JSON only: {"recommendations": ["...", "...", "..."]}'
         )
         # FAST_MODEL: this is a bounded, well-structured task (3 short fixes
         # for explicitly-listed issues) run per-post across potentially
@@ -982,7 +1074,12 @@ class ContentScorer(BaseAgent):
         # in small concurrent chunks — committing after each chunk for the
         # same reason as Pass 2. AI calls are the slowest, least predictable
         # step, so this is where a timeout is most likely to land.
-        budget = settings.CONTENT_AI_BUDGET_PER_RUN
+        # Off by default — see CONTENT_AI_AUTO_GENERATE. Rule-based insights
+        # cover every page for free; AI is requested per page by the user.
+        # Budget 0 defers everything, leaving each candidate's ai_rec_hash
+        # untouched so nothing is marked done and re-enabling the setting
+        # picks up exactly where this left off.
+        budget = settings.CONTENT_AI_BUDGET_PER_RUN if settings.CONTENT_AI_AUTO_GENERATE else 0
         to_process, ai_deferred = _prioritize_ai_candidates(ai_candidates, budget)
 
         ai_sem = asyncio.Semaphore(settings.CONTENT_AI_CONCURRENCY)
@@ -995,6 +1092,15 @@ class ContentScorer(BaseAgent):
                             candidate["title"], candidate["score"], candidate["word_count"],
                             candidate["issues"], candidate["breakdown"],
                             site_context=site.site_context or None,
+                            # Traffic only, and only because it's already in
+                            # hand. Live GA4/Search Console/PageSpeed lookups
+                            # are deliberately NOT done here: this loop runs
+                            # across hundreds of posts per night, and a
+                            # PageSpeed call alone takes ~20s. The detail
+                            # page's "Re-generate" does the full enrichment
+                            # for the one post a user is actually looking at.
+                            performance={"visitors_30d": candidate["traffic"]}
+                            if candidate.get("traffic") else None,
                         ),
                         timeout=30,
                     )

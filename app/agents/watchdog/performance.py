@@ -25,14 +25,20 @@ logger = logging.getLogger(__name__)
 PSI_API = "https://www.googleapis.com/pagespeedonline/v5/runPagespeed"
 
 
-async def _fetch_psi(client: httpx.AsyncClient, url: str) -> dict | None:
+async def _fetch_psi(
+    client: httpx.AsyncClient, url: str, strategy: str = "desktop",
+) -> dict | None:
     """
-    Call PageSpeed Insights API with strategy=desktop.
-    Returns parsed metrics dict or None on failure.
+    Call PageSpeed Insights API. Returns parsed metrics dict or None on failure.
     PSI is free without a key (up to ~25 req/100s per IP).
+
+    `strategy` is "desktop" (this monitor's site-wide sweep) or "mobile".
+    Mobile is the one that matters for search: Google indexes and ranks on
+    the mobile crawl, and mobile scores are routinely far worse than desktop
+    for the same page — so per-post content analysis asks for mobile.
     """
     try:
-        params = {"url": url, "strategy": "desktop", "category": "performance"}
+        params = {"url": url, "strategy": strategy, "category": "performance"}
         if settings.PSI_API_KEY:
             params["key"] = settings.PSI_API_KEY  # 25k/day vs ~25/100s keyless
         resp = await request_with_retries(

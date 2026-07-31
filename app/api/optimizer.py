@@ -1,4 +1,6 @@
 import asyncio
+import logging
+import re
 from datetime import datetime, timedelta, timezone
 from typing import Any
 from urllib.parse import urlparse
@@ -9,9 +11,10 @@ from sqlalchemy import ColumnElement, Float, delete, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.engine import get_db
-from app.database.models import Alert, ContentPost, Site
+from app.database.models import Alert, ContentPost, PerformanceSnapshot, Site
 from app.security.rate_limit import ai_limiter, job_limiter, rescan_limiter
 
+logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
@@ -84,6 +87,176 @@ def _detect_confirmation_page(posts: list[tuple[str, str, str]]) -> tuple[str, s
     return min(candidates, key=lambda c: len(urlparse(c[2]).path))
 
 
+# Google's published Core Web Vitals thresholds: (good_max, needs_work_max).
+# A value at or below the first is "good"; at or below the second is
+# "needs work"; above it is "poor". Encoded once here rather than as
+# magic numbers at each call site so the UI, alerts and any future export
+# all rate a metric identically.
+#
+# `tbt` is Total Blocking Time — a LAB metric PSI reports as a stand-in for
+# INP, which can only be measured on real users. It is deliberately NOT
+# labelled INP anywhere user-facing.
+_CWV_THRESHOLDS: dict[str, tuple[float, float]] = {
+    "lcp": (2500.0, 4000.0),   # ms — Largest Contentful Paint
+    "cls": (0.1, 0.25),        # unitless — Cumulative Layout Shift
+    "tbt": (200.0, 600.0),     # ms — Total Blocking Time
+    "ttfb": (800.0, 1800.0),   # ms — Time To First Byte
+}
+
+# Lighthouse's own score bands, which PSI colours green/orange/red.
+_SPEED_SCORE_GOOD = 90
+_SPEED_SCORE_NEEDS_WORK = 50
+
+
+def _rate_metric(metric: str, value: float | None) -> str | None:
+    """"good" | "needs_work" | "poor" for one Core Web Vital, or None when
+    the metric is unknown or wasn't measured."""
+    if value is None or metric not in _CWV_THRESHOLDS:
+        return None
+    good_max, needs_work_max = _CWV_THRESHOLDS[metric]
+    if value <= good_max:
+        return "good"
+    if value <= needs_work_max:
+        return "needs_work"
+    return "poor"
+
+
+def _rate_speed_score(score: int | None) -> str | None:
+    """Lighthouse performance score band. Higher is better here, the
+    opposite direction to the timing metrics above."""
+    if score is None:
+        return None
+    if score >= _SPEED_SCORE_GOOD:
+        return "good"
+    if score >= _SPEED_SCORE_NEEDS_WORK:
+        return "needs_work"
+    return "poor"
+
+
+# Typical organic CTR by average position, from published click-through
+# studies. These are deliberately COARSE and treated as an order-of-magnitude
+# expectation, never a target: real CTR swings hugely with query intent, SERP
+# features and brand. They exist only to answer "is this page's CTR wildly
+# below what its ranking should earn?" — a question worth asking, and one the
+# raw numbers don't answer on their own.
+_TYPICAL_CTR_BY_POSITION: list[tuple[float, float]] = [
+    (1.0, 28.0), (2.0, 15.0), (3.0, 11.0), (4.0, 8.0), (5.0, 6.0),
+    (6.0, 4.5), (7.0, 3.5), (8.0, 3.0), (9.0, 2.5), (10.0, 2.5),
+]
+# Below this fraction of the typical CTR, the gap is big enough to be a real
+# signal rather than normal variance.
+_CTR_UNDERPERFORM_RATIO = 0.5
+# A page has to actually be seen before "nobody clicks it" means anything.
+_CTR_INSIGHT_MIN_IMPRESSIONS = 100
+
+# Positions 4-15: ranking, but below the results that get the clicks. Small
+# improvements here move the most traffic, which is why they're worth
+# surfacing separately from queries already at #1.
+_STRIKING_MIN_POSITION = 4.0
+_STRIKING_MAX_POSITION = 15.0
+_STRIKING_MIN_IMPRESSIONS = 10
+
+
+def _typical_ctr(position: float) -> float | None:
+    """Roughly the CTR a result at this average position tends to earn.
+    None past position 10, where rates flatten into noise and any specific
+    number would be false precision."""
+    if position <= 0:
+        return None
+    for max_pos, ctr in _TYPICAL_CTR_BY_POSITION:
+        if position <= max_pos:
+            return ctr
+    return None
+
+
+def _ctr_opportunity(
+    position: float, ctr: float, impressions: int,
+) -> dict[str, Any] | None:
+    """Flags a page that ranks well but is rarely clicked — the signature of
+    a title/meta-description problem rather than a ranking problem, and the
+    single most actionable thing GSC can tell a content editor.
+
+    Returns None unless the page has enough impressions to judge, sits in
+    the range where typical CTR is meaningful, and falls far enough short to
+    be a signal rather than noise.
+    """
+    if impressions < _CTR_INSIGHT_MIN_IMPRESSIONS:
+        return None
+    expected = _typical_ctr(position)
+    if expected is None or ctr >= expected * _CTR_UNDERPERFORM_RATIO:
+        return None
+    # Clicks this page would earn at a typical CTR for its current ranking —
+    # framed as the gap at TODAY's position, so it never reads as a promise
+    # that comes from ranking higher.
+    potential = int(impressions * expected / 100)
+    return {
+        "position": position,
+        "ctr": ctr,
+        "typical_ctr": expected,
+        "potential_clicks": potential,
+    }
+
+
+def _striking_distance(queries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Queries ranking just below the click-earning positions, with enough
+    impressions that improving them would actually matter."""
+    return [
+        q for q in queries
+        if _STRIKING_MIN_POSITION <= q["position"] <= _STRIKING_MAX_POSITION
+        and q["impressions"] >= _STRIKING_MIN_IMPRESSIONS
+    ]
+
+
+# Ordered so the stacked bar and legend always read desktop → mobile →
+# tablet regardless of which happened to win, and so a colour never moves
+# between categories when the ranking changes.
+_DEVICE_ORDER = ["desktop", "mobile", "tablet"]
+
+
+def _device_shares(counts: dict[str, int]) -> list[dict[str, Any]]:
+    """Device categories as [{device, users, pct}], biggest-share info kept
+    in a fixed category order.
+
+    Percentages are computed against the total of everything GA4 returned —
+    including categories outside _DEVICE_ORDER (GA4 occasionally reports
+    "smart tv") — so the parts always describe the real whole rather than
+    summing past 100%. Any such extra category is folded into a final
+    "other" row rather than silently dropped.
+    """
+    total = sum(counts.values())
+    if total <= 0:
+        return []
+
+    rows: list[dict[str, Any]] = []
+    for device in _DEVICE_ORDER:
+        users = counts.get(device, 0)
+        if users > 0:
+            rows.append({"device": device, "users": users, "pct": round(users / total * 100, 1)})
+
+    other = sum(v for k, v in counts.items() if k not in _DEVICE_ORDER)
+    if other > 0:
+        rows.append({"device": "other", "users": other, "pct": round(other / total * 100, 1)})
+    return rows
+
+
+def _page_location_regex(path: str) -> str:
+    """A GA4 FULL_REGEXP matching exactly this page and nothing else.
+
+    The funnel used to match page_location with CONTAINS, which quietly
+    swept in any URL merely *containing* the path — on a real site that
+    included "/some-post/>", a malformed URL produced by broken markup
+    (href="...post/>"). Those visitors hit a 404, never read the post, and
+    still inflated the funnel's entry count above the traffic tile's,
+    which matches pagePath exactly.
+
+    Anchored to the whole URL (FULL_REGEXP must match end-to-end), with an
+    optional trailing slash, query string and fragment so genuine
+    "?utm_source=..." visits still count.
+    """
+    core = re.escape(path.rstrip("/"))
+    return rf"https?://[^/]+{core}/?(\?.*)?(#.*)?"
+
+
 def _pct_change(previous: int, current: int) -> float | None:
     """None when there's no real baseline to compare against (0 in the
     prior period) — a manufactured "+100%"/infinite% would be misleading."""
@@ -123,6 +296,7 @@ class ContentHealthResponse(BaseModel):
     reading_time_minutes: int
     score_breakdown: dict
     ai_recommendation: str | None
+    ai_guidance: dict | None = None
 
 
 class ContentHealthListResponse(BaseModel):
@@ -147,6 +321,7 @@ class ContentHealthDetailResponse(BaseModel):
     reading_time_minutes: int
     score_breakdown: dict
     ai_recommendation: str | None
+    ai_guidance: dict | None = None
 
 
 class InternalLinkResponse(BaseModel):
@@ -309,6 +484,7 @@ def _serialize_content_post(post: ContentPost, site_name: str) -> dict[str, Any]
         "reading_time_minutes": post.reading_time_minutes or 0,
         "score_breakdown": post.score_breakdown or {},
         "ai_recommendation": post.ai_recommendation,
+        "ai_guidance": post.ai_guidance,
     }
 
 
@@ -442,6 +618,7 @@ async def get_content_post_detail(
         "reading_time_minutes": post.reading_time_minutes or 0,
         "score_breakdown": post.score_breakdown or {},
         "ai_recommendation": post.ai_recommendation,
+        "ai_guidance": post.ai_guidance,
     }
 
 
@@ -461,17 +638,288 @@ class ConversionFlow(BaseModel):
     submission_rate: float | None = None  # 0-1, submitted/entered
 
 
+class DeviceShare(BaseModel):
+    device: str  # "desktop" | "mobile" | "tablet" | "other"
+    users: int
+    pct: float  # 0-100
+
+
 class ContentAnalyticsResponse(BaseModel):
     connected: bool
     daily_traffic: list[DailyTrafficPoint] = []
+    # Sum of per-day active users — i.e. VISITS (a person returning on three
+    # days counts three times). Drives the chart; deliberately distinct from
+    # `visitors_30d` below, which the funnel is built on.
     traffic_30d: int = 0
     traffic_prev_30d: int = 0
     traffic_change_pct: float | None = None
+    # Unique PEOPLE over the window, deduplicated by GA4 across the whole
+    # range. This is what every funnel step counts, so it's reported
+    # separately rather than letting the UI imply the visit total and the
+    # funnel's entry count should match — they measure different things and
+    # showing them side by side as one number was the reported bug.
+    visitors_30d: int = 0
     bounce_rate: float | None = None  # 0-100
     avg_engagement_time: float | None = None  # seconds
+    # How this post's readers split across device categories — the context
+    # that says which PageSpeed strategy actually reflects your audience.
+    devices: list[DeviceShare] = []
     flows: list[ConversionFlow] = []
-    total_leads: int | None = None  # sum of `submitted` across flows; None if no confirmation page detected
+    # Unique people who read this post and later reached the confirmation
+    # page, measured DIRECTLY — never the sum of `submitted` across flows,
+    # which double-counts anyone whose journey satisfied more than one route
+    # (they all end at the same confirmation page). None if no confirmation
+    # page was detected for this site.
+    total_leads: int | None = None
     error: str | None = None
+
+
+class PageSpeedMetric(BaseModel):
+    key: str
+    label: str
+    value: float
+    unit: str          # "ms" | "" (CLS is unitless)
+    rating: str | None  # "good" | "needs_work" | "poor"
+
+
+class PageSpeedResponse(BaseModel):
+    # False when this page has never been tested — the UI offers to run one
+    # rather than showing an error, since PSI is opt-in per page.
+    tested: bool
+    score: int | None = None
+    rating: str | None = None
+    strategy: str = "desktop"
+    metrics: list[PageSpeedMetric] = []
+    tested_at: datetime | None = None
+    page_url: str | None = None
+    error: str | None = None
+
+
+def _serialize_pagespeed(snap: PerformanceSnapshot) -> dict[str, Any]:
+    """One stored snapshot as the API's metric list. `fid` holds Total
+    Blocking Time (see PerformanceMonitor) — surfaced under its real name so
+    nobody reads it as a field-measured INP."""
+    metrics = [
+        ("lcp", "Largest Contentful Paint", snap.lcp, "ms"),
+        ("cls", "Cumulative Layout Shift", snap.cls, ""),
+        ("tbt", "Total Blocking Time", snap.fid, "ms"),
+        ("ttfb", "Time to First Byte", snap.ttfb, "ms"),
+    ]
+    return {
+        "tested": True,
+        "score": snap.speed_score,
+        "rating": _rate_speed_score(snap.speed_score),
+        "strategy": snap.strategy,
+        "page_url": snap.page_url,
+        "tested_at": snap.snapshot_at,
+        "metrics": [
+            {
+                "key": key, "label": label, "value": round(value, 3),
+                "unit": unit, "rating": _rate_metric(key, value),
+            }
+            for key, label, value, unit in metrics
+        ],
+    }
+
+
+async def _latest_pagespeed(
+    page_url: str, strategy: str, db: AsyncSession,
+) -> PerformanceSnapshot | None:
+    result = await db.execute(
+        select(PerformanceSnapshot)
+        .where(
+            PerformanceSnapshot.page_url == page_url,
+            PerformanceSnapshot.strategy == strategy,
+        )
+        .order_by(PerformanceSnapshot.snapshot_at.desc())
+        .limit(1)
+    )
+    return result.scalar_one_or_none()
+
+
+class SearchQueryRow(BaseModel):
+    query: str
+    clicks: int
+    impressions: int
+    ctr: float       # 0-100
+    position: float
+
+
+class SearchDailyPoint(BaseModel):
+    date: str
+    clicks: int
+    impressions: int
+
+
+class CtrOpportunity(BaseModel):
+    position: float
+    ctr: float
+    typical_ctr: float
+    potential_clicks: int
+
+
+class SearchConsoleResponse(BaseModel):
+    connected: bool
+    range_start: str | None = None
+    range_end: str | None = None
+    clicks: int = 0
+    impressions: int = 0
+    ctr: float = 0.0        # 0-100
+    position: float = 0.0
+    # Deltas vs the immediately preceding window of equal length. Position is
+    # the one metric where a NEGATIVE change is an improvement.
+    clicks_change_pct: float | None = None
+    impressions_change_pct: float | None = None
+    position_change: float | None = None
+    daily: list[SearchDailyPoint] = []
+    queries: list[SearchQueryRow] = []
+    striking_distance: list[SearchQueryRow] = []
+    ctr_opportunity: CtrOpportunity | None = None
+    error: str | None = None
+
+
+# Search Console finalizes data ~2-3 days late. Ending the window there
+# rather than "today" keeps the current period as complete as the one it's
+# compared against — otherwise every page would look like it was declining,
+# purely because the newest days hadn't landed yet.
+_GSC_LAG_DAYS = 3
+_GSC_WINDOW_DAYS = 28
+
+
+@router.get("/content-health/{ref}/search-console", response_model=SearchConsoleResponse)
+async def get_content_search_console(
+    ref: str,
+    site_id: str | None = None,
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """Google Search organic performance for one post: totals vs the previous
+    period, a daily trend, the queries it actually surfaces for, and the two
+    insights worth acting on — a CTR far below what its ranking should earn,
+    and queries sitting just outside the click-earning positions.
+
+    Degrades gracefully (200 with `connected: false` / `error`) — this is a
+    supplementary panel, not the page's core data.
+    """
+    from app.api.auth import get_google_token
+    from app.connectors.search_console import SearchConsoleConnector
+    from app.database.models import SiteConfig
+
+    post, _site_name = await _resolve_post_ref(ref, site_id, db)
+
+    cfg_r = await db.execute(select(SiteConfig).where(SiteConfig.site_id == post.site_id))
+    cfg = cfg_r.scalar_one_or_none()
+    site = await db.get(Site, post.site_id)
+    token = await get_google_token(db)
+    gsc_url = (cfg.gsc_site_url if cfg else None) or (site.url if site else None)
+    if not token or not gsc_url:
+        return {"connected": False}
+
+    end = datetime.now(timezone.utc).date() - timedelta(days=_GSC_LAG_DAYS)
+    start = end - timedelta(days=_GSC_WINDOW_DAYS - 1)
+    prev_end = start - timedelta(days=1)
+    prev_start = prev_end - timedelta(days=_GSC_WINDOW_DAYS - 1)
+
+    try:
+        gsc = SearchConsoleConnector(token.access_token)
+        summary, previous, daily, queries = await asyncio.gather(
+            gsc.get_page_search_summary(gsc_url, post.url, str(start), str(end)),
+            gsc.get_page_search_summary(gsc_url, post.url, str(prev_start), str(prev_end)),
+            gsc.get_page_daily_search(gsc_url, post.url, str(start), str(end)),
+            gsc.get_page_query_details(gsc_url, post.url, str(start), str(end)),
+        )
+    except Exception as exc:
+        return {"connected": True, "error": f"Couldn't load Search Console data: {exc}"}
+
+    return {
+        "connected": True,
+        "range_start": str(start),
+        "range_end": str(end),
+        **summary,
+        "clicks_change_pct": _pct_change(previous["clicks"], summary["clicks"]),
+        "impressions_change_pct": _pct_change(previous["impressions"], summary["impressions"]),
+        # A raw difference, not a percentage: "position improved by 1.4" is
+        # meaningful where "position improved 18%" is not.
+        "position_change": (
+            round(summary["position"] - previous["position"], 1)
+            if previous["position"] and summary["position"] else None
+        ),
+        "daily": daily,
+        "queries": queries[:15],
+        "striking_distance": _striking_distance(queries)[:8],
+        "ctr_opportunity": _ctr_opportunity(
+            summary["position"], summary["ctr"], summary["impressions"],
+        ),
+    }
+
+
+@router.get("/content-health/{ref}/pagespeed", response_model=PageSpeedResponse)
+async def get_content_pagespeed(
+    ref: str,
+    site_id: str | None = None,
+    strategy: str = Query("desktop", pattern="^(mobile|desktop)$"),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """The most recent stored PageSpeed result for this post, if any.
+
+    Deliberately never calls PSI itself — a live run takes 10-30s, which is
+    far too slow to sit in a page load. This returns instantly (cached or
+    `tested: false`) and the POST below runs the real test on request.
+    """
+    post, _site_name = await _resolve_post_ref(ref, site_id, db)
+    snap = await _latest_pagespeed(post.url, strategy, db)
+    if snap is None:
+        return {"tested": False, "strategy": strategy, "page_url": post.url}
+    return _serialize_pagespeed(snap)
+
+
+@router.post(
+    "/content-health/{ref}/pagespeed",
+    response_model=PageSpeedResponse,
+    dependencies=[Depends(job_limiter)],
+)
+async def run_content_pagespeed(
+    ref: str,
+    site_id: str | None = None,
+    strategy: str = Query("desktop", pattern="^(mobile|desktop)$"),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """Run a live PageSpeed Insights test for this post and store the result.
+
+    Slow by nature (PSI runs a real Lighthouse pass), hence rate-limited and
+    user-triggered rather than part of any automatic sweep.
+    """
+    import httpx
+
+    from app.agents.watchdog.performance import _fetch_psi
+
+    post, _site_name = await _resolve_post_ref(ref, site_id, db)
+
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        result = await _fetch_psi(client, post.url, strategy=strategy)
+
+    if result is None:
+        # Surfaced as a normal 200 with `error` so the card can show a retry
+        # affordance; a 5xx here would read as "the app is broken" when the
+        # real story is "Google didn't answer this time".
+        return {
+            "tested": False, "strategy": strategy, "page_url": post.url,
+            "error": "PageSpeed Insights didn't return a result — it may be rate limited. Try again shortly.",
+        }
+
+    snapshot = PerformanceSnapshot(
+        site_id=post.site_id,
+        page_url=post.url,
+        lcp=result["lcp"],
+        cls=result["cls"],
+        fid=result["fid"],
+        ttfb=result["ttfb"],
+        speed_score=result["score"],
+        strategy=strategy,
+    )
+    db.add(snapshot)
+    await db.commit()
+    await db.refresh(snapshot)
+    return _serialize_pagespeed(snapshot)
 
 
 @router.get("/content-health/{ref}/analytics", response_model=ContentAnalyticsResponse)
@@ -522,9 +970,16 @@ async def get_content_post_analytics(
         prev_points = _fill_daily_gaps(day_counts, prev_start, prev_end)
         traffic_prev_30d = sum(p["views"] for p in prev_points)
 
-        engagement = (await ga.get_engagement_metrics_by_path(
-            cfg.ga_property_id, [post_path], range_start, range_end,
-        )).get(post_path)
+        engagement, device_counts = await asyncio.gather(
+            ga.get_engagement_metrics_by_path(
+                cfg.ga_property_id, [post_path], range_start, range_end,
+            ),
+            ga.get_device_breakdown_by_path(
+                cfg.ga_property_id, [post_path], range_start, range_end,
+            ),
+        )
+        engagement = engagement.get(post_path)
+        devices = _device_shares(device_counts)
 
         all_posts = list((await db.execute(
             select(ContentPost.id, ContentPost.title, ContentPost.url)
@@ -533,10 +988,14 @@ async def get_content_post_analytics(
         targets = _detect_conversion_targets(all_posts, exclude_id=post.id)
         confirmation = _detect_confirmation_page(all_posts)
 
+        # Anchored so a malformed URL that merely CONTAINS this path (e.g.
+        # "/post/>" from broken markup) can't be counted as reading the post.
+        post_step = {"label": post.title[:60], "match_type": "regex", "pattern": _page_location_regex(post_path)}
+
         flows: list[dict[str, Any]] = []
         for label, (_target_id, target_title, target_url) in targets.items():
             steps = [
-                {"label": post.title[:60], "match_type": "contains", "pattern": post_path},
+                post_step,
                 {"label": label, "match_type": "contains", "pattern": urlparse(target_url).path},
             ]
             if confirmation:
@@ -563,7 +1022,24 @@ async def get_content_post_analytics(
                 "submission_rate": (submitted / entered) if confirmation and entered else None,
             })
 
-        total_leads = sum(f["submitted"] for f in flows) if confirmation and flows else None
+        # Unique converters, measured directly. Every route above ends at the
+        # same confirmation page, so a visitor who passed through both
+        # Contact AND Pricing appears in both flows — summing them reported
+        # one real person as two leads.
+        visitors_30d = flows[0]["entered"] if flows else 0
+        total_leads = None
+        if confirmation:
+            lead_funnel = await ga.run_funnel_report(
+                cfg.ga_property_id,
+                steps=[
+                    post_step,
+                    {"label": "Submitted", "match_type": "contains",
+                     "pattern": urlparse(confirmation[2]).path},
+                ],
+                start_date=range_start, end_date=range_end,
+            )
+            visitors_30d = lead_funnel["step_results"][0]["active_users"]
+            total_leads = lead_funnel["step_results"][1]["active_users"]
 
         return {
             "connected": True,
@@ -571,8 +1047,10 @@ async def get_content_post_analytics(
             "traffic_30d": traffic_30d,
             "traffic_prev_30d": traffic_prev_30d,
             "traffic_change_pct": _pct_change(traffic_prev_30d, traffic_30d),
+            "visitors_30d": visitors_30d,
             "bounce_rate": round(engagement["bounce_rate"] * 100, 1) if engagement else None,
             "avg_engagement_time": round(engagement["avg_engagement_time"], 1) if engagement else None,
+            "devices": devices,
             "flows": flows,
             "total_leads": total_leads,
         }
@@ -696,6 +1174,230 @@ async def rescan_content_post(
     }
 
 
+class PageInsight(BaseModel):
+    id: str
+    source: str      # "content" | "traffic" | "search" | "speed"
+    severity: str    # "critical" | "warning" | "info"
+    title: str
+    detail: str
+    action: str
+    evidence: str
+    impact: int
+
+
+class InsightSummary(BaseModel):
+    visitors: int | None = None
+    leads: int | None = None
+    search_clicks: int | None = None
+    search_position: float | None = None
+    speed_score: int | None = None
+    speed_strategy: str | None = None
+
+
+class PageInsightsResponse(BaseModel):
+    summary: InsightSummary
+    insights: list[PageInsight]
+    # Which sources actually contributed, so the UI can say "connect Search
+    # Console for more" rather than silently showing a thinner analysis.
+    sources: list[str]
+
+
+@router.get("/content-health/{ref}/insights", response_model=PageInsightsResponse)
+async def get_content_insights(
+    ref: str,
+    site_id: str | None = None,
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """Rule-based findings across content, traffic, search and speed, ranked
+    by severity and estimated impact.
+
+    Deliberately involves NO AI: this is the page's baseline analysis, shown
+    on every visit, so it has to be instant, free and identical for identical
+    data. The AI layer is a separate, explicitly-requested call that builds
+    on these findings.
+
+    Returns the headline numbers alongside the findings so the overview needs
+    exactly one request rather than one per data source.
+    """
+    from app.agents.optimizer.insights import build_insights
+
+    post, _site_name = await _resolve_post_ref(ref, site_id, db)
+    perf = await _collect_post_performance(post, db)
+
+    sources: list[str] = []
+    traffic: dict[str, Any] | None = None
+    if perf.get("visitors_30d") is not None or perf.get("bounce_rate") is not None:
+        sources.append("traffic")
+        traffic = {
+            "visitors": perf.get("visitors_30d"),
+            "bounce_rate": perf.get("bounce_rate"),
+            "avg_engagement_time": perf.get("avg_engagement_time"),
+            "leads": perf.get("leads"),
+        }
+
+    search: dict[str, Any] | None = None
+    if perf.get("search_impressions") is not None:
+        sources.append("search")
+        search = {
+            "clicks": perf.get("search_clicks"),
+            "position_change": perf.get("search_position_change"),
+            "ctr_opportunity": perf.get("ctr_opportunity"),
+            "striking_distance": perf.get("top_queries_striking") or [],
+        }
+
+    speed: dict[str, Any] | None = None
+    if perf.get("speed_score") is not None:
+        sources.append("speed")
+        speed = {
+            "score": perf.get("speed_score"),
+            "strategy": perf.get("speed_strategy"),
+            "failing_vitals": perf.get("failing_vitals"),
+            "visitors": perf.get("visitors_30d") or 0,
+        }
+
+    breakdown = post.score_breakdown or {}
+    if breakdown:
+        sources.append("content")
+
+    return {
+        "summary": {
+            "visitors": perf.get("visitors_30d"),
+            "leads": perf.get("leads"),
+            "search_clicks": perf.get("search_clicks"),
+            "search_position": perf.get("search_position"),
+            "speed_score": perf.get("speed_score"),
+            "speed_strategy": perf.get("speed_strategy"),
+        },
+        "insights": build_insights(
+            breakdown=breakdown, traffic=traffic, search=search, speed=speed,
+            issues=post.issues or [],
+        ),
+        "sources": sources,
+    }
+
+
+async def _collect_post_performance(post: ContentPost, db: AsyncSession) -> dict[str, Any]:
+    """Everything measured about one page, for the AI recommendation prompt.
+
+    Each source is gathered independently and failures are swallowed per
+    source: a site with no GA4, an unverified Search Console property, or a
+    page never speed-tested must still get a recommendation — just a less
+    informed one. Search Console is the highest-value source here, since its
+    real query wording is what lets the model rewrite a title to match how
+    people actually search.
+
+    Reads the STORED PageSpeed snapshot rather than running a live test —
+    a live PSI pass takes ~20s, far too slow to sit inside a button click
+    that the user is waiting on.
+    """
+    from app.api.auth import get_google_token
+    from app.connectors.analytics import AnalyticsConnector
+    from app.connectors.search_console import SearchConsoleConnector
+    from app.database.models import SiteConfig
+
+    perf: dict[str, Any] = {}
+    if post.traffic_30d:
+        perf["visitors_30d"] = post.traffic_30d
+
+    cfg_r = await db.execute(select(SiteConfig).where(SiteConfig.site_id == post.site_id))
+    cfg = cfg_r.scalar_one_or_none()
+    site = await db.get(Site, post.site_id)
+    token = await get_google_token(db)
+
+    # ── GA4 engagement + conversions ──────────────────────────────────────
+    if token and cfg and cfg.ga_property_id:
+        post_path = urlparse(post.url).path
+        today = datetime.now(timezone.utc).date()
+        start, end = (today - timedelta(days=29)).isoformat(), today.isoformat()
+        try:
+            ga = AnalyticsConnector(token.access_token)
+            engagement = (await ga.get_engagement_metrics_by_path(
+                cfg.ga_property_id, [post_path], start, end,
+            )).get(post_path)
+            if engagement:
+                perf["bounce_rate"] = engagement["bounce_rate"] * 100
+                perf["avg_engagement_time"] = engagement["avg_engagement_time"]
+
+            # Conversions: the same deduplicated post → confirmation-page
+            # measurement the Traffic tab reports, in one funnel call.
+            all_posts = list((await db.execute(
+                select(ContentPost.id, ContentPost.title, ContentPost.url)
+                .where(ContentPost.site_id == post.site_id)
+            )).all())
+            confirmation = _detect_confirmation_page(all_posts)
+            if confirmation:
+                funnel = await ga.run_funnel_report(
+                    cfg.ga_property_id,
+                    steps=[
+                        {"label": "post", "match_type": "regex",
+                         "pattern": _page_location_regex(post_path)},
+                        {"label": "converted", "match_type": "contains",
+                         "pattern": urlparse(confirmation[2]).path},
+                    ],
+                    start_date=start, end_date=end,
+                )
+                perf["visitors_30d"] = funnel["step_results"][0]["active_users"]
+                perf["leads"] = funnel["step_results"][1]["active_users"]
+        except Exception as exc:
+            logger.info("GA4 enrichment unavailable for %s: %s", post.url, exc)
+
+    # ── Search Console ────────────────────────────────────────────────────
+    gsc_url = (cfg.gsc_site_url if cfg else None) or (site.url if site else None)
+    if token and gsc_url:
+        try:
+            gsc = SearchConsoleConnector(token.access_token)
+            end = datetime.now(timezone.utc).date() - timedelta(days=_GSC_LAG_DAYS)
+            start = end - timedelta(days=_GSC_WINDOW_DAYS - 1)
+            prev_end = start - timedelta(days=1)
+            prev_start = prev_end - timedelta(days=_GSC_WINDOW_DAYS - 1)
+            summary, previous, queries = await asyncio.gather(
+                gsc.get_page_search_summary(gsc_url, post.url, str(start), str(end)),
+                gsc.get_page_search_summary(gsc_url, post.url, str(prev_start), str(prev_end)),
+                gsc.get_page_query_details(gsc_url, post.url, str(start), str(end)),
+            )
+            if summary["impressions"]:
+                striking = _striking_distance(queries)
+                perf["search_clicks"] = summary["clicks"]
+                perf["search_impressions"] = summary["impressions"]
+                perf["search_ctr"] = summary["ctr"]
+                perf["search_position"] = summary["position"]
+                perf["search_position_change"] = (
+                    round(summary["position"] - previous["position"], 1)
+                    if previous["position"] and summary["position"] else None
+                )
+                perf["ctr_opportunity"] = _ctr_opportunity(
+                    summary["position"], summary["ctr"], summary["impressions"],
+                )
+                perf["top_queries_striking"] = striking
+                # Striking-distance queries first — those are the ones worth
+                # writing for; fall back to plain top queries if none qualify.
+                perf["top_queries"] = striking[:5] or queries[:5]
+                # The unabridged list: the guidance pass reads the page
+                # against real demand, so it needs the full picture rather
+                # than the handful the prompt summary shows.
+                perf["all_queries"] = queries
+        except Exception as exc:
+            logger.info("Search Console enrichment unavailable for %s: %s", post.url, exc)
+
+    # ── PageSpeed (stored, never a live run) ──────────────────────────────
+    snap = await _latest_pagespeed(post.url, "desktop", db)
+    if snap is None:
+        snap = await _latest_pagespeed(post.url, "mobile", db)
+    if snap is not None:
+        perf["speed_score"] = snap.speed_score
+        perf["speed_strategy"] = snap.strategy
+        perf["failing_vitals"] = [
+            label
+            for key, label, value in (
+                ("lcp", "LCP", snap.lcp), ("cls", "CLS", snap.cls),
+                ("tbt", "TBT", snap.fid), ("ttfb", "TTFB", snap.ttfb),
+            )
+            if _rate_metric(key, value) in ("needs_work", "poor")
+        ]
+
+    return perf
+
+
 @router.post("/content-health/{post_id}/regenerate-ai", dependencies=[Depends(ai_limiter)])
 async def regenerate_ai_recommendation(
     post_id: str,
@@ -706,23 +1408,88 @@ async def regenerate_ai_recommendation(
     if not post:
         raise HTTPException(status_code=404, detail="Post not found")
 
-    from app.agents.optimizer.content_scorer import _generate_ai_recommendation
+    from app.agents.optimizer.guidance import generate_page_guidance, guidance_as_text
+    from app.agents.optimizer.insights import build_insights
+    from app.connectors.wordpress import WordPressConnector
     from app.database.models import Site as SiteModel
+
     site_r = await db.execute(select(SiteModel).where(SiteModel.id == post.site_id))
     site_obj = site_r.scalar_one_or_none()
-    ai_rec = await _generate_ai_recommendation(
-        post.title, post.health_score, post.word_count, post.issues or [],
-        post.score_breakdown or {},
+    performance = await _collect_post_performance(post, db)
+
+    # The page's real text — the whole point of this pass. Fetched live
+    # because only the content HASH is stored, never the body. A fetch
+    # failure degrades to metrics-and-queries rather than failing the
+    # request; the guidance is just less grounded.
+    content_html = ""
+    if post.wp_post_id and site_obj:
+        wp = WordPressConnector(site_obj.url, site_obj.api_key)
+        try:
+            wp_post = await wp.get_post(post.wp_post_id, content_type=post.content_type)
+            content_html = (wp_post or {}).get("content", {}).get("rendered", "") or ""
+        except Exception as exc:
+            logger.info("Couldn't fetch live content for %s: %s", post.url, exc)
+        finally:
+            await wp.close()
+
+    breakdown = post.score_breakdown or {}
+    known = build_insights(
+        breakdown=breakdown,
+        traffic={
+            "visitors": performance.get("visitors_30d"),
+            "bounce_rate": performance.get("bounce_rate"),
+            "avg_engagement_time": performance.get("avg_engagement_time"),
+            "leads": performance.get("leads"),
+        },
+        search={
+            "clicks": performance.get("search_clicks"),
+            "ctr_opportunity": performance.get("ctr_opportunity"),
+            "striking_distance": performance.get("top_queries_striking") or [],
+            "position_change": performance.get("search_position_change"),
+        },
+        speed={
+            "score": performance.get("speed_score"),
+            "strategy": performance.get("speed_strategy"),
+            "failing_vitals": performance.get("failing_vitals"),
+            "visitors": performance.get("visitors_30d") or 0,
+        } if performance.get("speed_score") is not None else None,
+        issues=post.issues or [],
+    )
+
+    guidance = await generate_page_guidance(
+        title=post.title,
+        url=post.url,
+        content_html=content_html,
+        meta_description=(breakdown.get("meta_description") or {}).get("preview"),
+        metrics={
+            "Visitors (30d)": performance.get("visitors_30d"),
+            "Bounce rate": f"{performance['bounce_rate']:.0f}%" if performance.get("bounce_rate") is not None else None,
+            "Avg engagement": f"{performance['avg_engagement_time']:.0f}s" if performance.get("avg_engagement_time") is not None else None,
+            "Search clicks (28d)": performance.get("search_clicks"),
+            "Search impressions (28d)": performance.get("search_impressions"),
+            "Search CTR": f"{performance['search_ctr']:.2f}%" if performance.get("search_ctr") is not None else None,
+            "Avg position": performance.get("search_position"),
+            "Word count": post.word_count,
+            "Health score": f"{post.health_score}/100",
+            "PageSpeed": performance.get("speed_score"),
+        },
+        queries=performance.get("all_queries") or performance.get("top_queries") or [],
+        known_findings=[f"{i['title']} — {i['detail']}" for i in known],
         site_context=site_obj.site_context if site_obj else None,
     )
-    # None = generation failed — keep any existing text. "" = genuinely
-    # clean — clear it, so a manual "Re-generate" on a fixed post doesn't
-    # keep showing advice for an issue that no longer exists.
-    if ai_rec is not None:
-        post.ai_recommendation = ai_rec or None
+
+    # None = generation failed — leave whatever is stored alone rather than
+    # wiping guidance that may still be accurate.
+    if guidance is not None:
+        post.ai_guidance = guidance
+        post.ai_recommendation = guidance_as_text(guidance) or None
         await db.commit()
 
-    return {"ai_recommendation": post.ai_recommendation}
+    return {
+        "ai_recommendation": post.ai_recommendation,
+        "ai_guidance": post.ai_guidance,
+        "generation_failed": guidance is None,
+    }
 
 
 @router.get("/internal-links", response_model=list[InternalLinkResponse])

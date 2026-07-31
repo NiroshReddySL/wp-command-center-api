@@ -28,6 +28,13 @@ class Settings(BaseSettings):
     # runtime regardless of site size. Posts are prioritized worst-score-first
     # (then by traffic), so the neediest content is always served first; any
     # posts beyond the cap simply carry over to the next run untouched.
+    # Whether the nightly ContentScorer generates AI recommendations on its
+    # own. OFF by default: every page already gets a full rule-based analysis
+    # (app/agents/optimizer/insights.py) for free and instantly, so spending
+    # OpenAI budget generating prose for hundreds of pages nobody has opened
+    # is waste. Users request AI synthesis per page, on the page. Set true to
+    # restore automatic generation, bounded by the budget below.
+    CONTENT_AI_AUTO_GENERATE: bool = False
     CONTENT_AI_BUDGET_PER_RUN: int = 200
     CONTENT_AI_CONCURRENCY: int = 5
     # Max posts/pages given full analysis (live-page crawl + scoring + AI
