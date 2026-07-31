@@ -70,13 +70,25 @@ class TestSweep:
     never comes back is never touched again, so its entry can only be
     reclaimed by a periodic pass — not by cleanup on access."""
 
+    @staticmethod
+    def _force_next_sweep(rl, now: float) -> None:
+        """Make the amortized guard let the next `_sweep` through.
+
+        Deliberately relative to `now`, never a literal 0.0: `time.monotonic()`
+        counts from an arbitrary origin, and on Linux that origin is boot, so a
+        fresh process reads ~30s. `0.0` therefore reads as "swept 30 seconds
+        ago" there and the sweep is skipped — which is exactly how these tests
+        passed on macOS (monotonic = a large uptime) and failed in CI.
+        """
+        rl._last_sweep = now - (rl._SWEEP_EVERY_SECONDS + 1)
+
     def test_reclaims_keys_no_limiter_can_still_care_about(self) -> None:
         import app.security.rate_limit as rl
 
         now = time.monotonic()
         rl._hits["test-sweep:stale"] = deque([now - (rl._MAX_WINDOW_SECONDS + 60)])
         rl._hits["test-sweep:empty"] = deque()
-        rl._last_sweep = 0.0  # force the amortized sweep to run
+        self._force_next_sweep(rl, now)
 
         rl._sweep(now)
 
@@ -88,12 +100,33 @@ class TestSweep:
 
         now = time.monotonic()
         rl._hits["test-sweep:active"] = deque([now - 5])
-        rl._last_sweep = 0.0
+        self._force_next_sweep(rl, now)
 
         rl._sweep(now)
 
+        # Only meaningful because the sweep genuinely ran — with the old
+        # `_last_sweep = 0.0` this assertion also held when it was skipped.
+        assert rl._last_sweep == now
         assert "test-sweep:active" in rl._hits
         rl._hits.pop("test-sweep:active", None)
+
+    def test_works_when_the_monotonic_clock_starts_near_zero(self) -> None:
+        """Linux counts `time.monotonic()` from boot, so a freshly-started
+        process reads a small number and stale timestamps go negative. macOS
+        reads a large uptime instead, which is why this divergence only ever
+        showed up in CI. The sweep must not care about the clock's origin.
+        """
+        import app.security.rate_limit as rl
+
+        now = 30.0  # a process that started 30 seconds after boot
+        stale = now - (rl._MAX_WINDOW_SECONDS + 60)
+        assert stale < 0  # the case that broke
+        rl._hits["test-sweep:tiny-clock"] = deque([stale])
+        self._force_next_sweep(rl, now)
+
+        rl._sweep(now)
+
+        assert "test-sweep:tiny-clock" not in rl._hits
 
     def test_is_amortized_not_run_on_every_request(self) -> None:
         import app.security.rate_limit as rl
