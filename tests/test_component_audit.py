@@ -24,6 +24,7 @@ from app.agents.watchdog.plugin_audit import (
     _version_lt,
     active_vulnerabilities,
     plugin_component,
+    resolve_active_vulns,
     theme_component,
 )
 from app.api.watchdog import (
@@ -33,7 +34,7 @@ from app.api.watchdog import (
     _normalize_slug,
 )
 from app.connectors.wpscan import VulnLookup
-from app.database.models import VulnerabilityCache
+from app.database.models import PluginAudit, VulnerabilityCache
 
 
 class TestPluginParsing:
@@ -335,3 +336,43 @@ class TestQuota:
 
         quota = Quota(limit=25, remaining=settings.WPSCAN_QUOTA_RESERVE)
         assert max(0, quota.remaining - settings.WPSCAN_QUOTA_RESERVE) == 0
+
+
+class TestUnknownDoesNotClearAKnownFinding:
+    """Regression. A cache miss with no quota left made the lookup return
+    None, which recomputed to "no vulnerabilities" and demoted a component
+    from critical to merely outdated — wiping its CVE list — while its alert
+    went on saying "vulnerable". Observed live: Avada Builder oscillated
+    between critical and high from run to run depending on whether its cached
+    answer happened to be available.
+    """
+
+    @staticmethod
+    def _audit(vulns):
+        return PluginAudit(
+            site_id="s", plugin_slug="fusion-builder", component_type="plugin",
+            installed_version="3.12.2", latest_version="3.12.2",
+            vulnerability_details={"vulnerabilities": vulns} if vulns else {},
+        )
+
+    def test_a_failed_lookup_keeps_the_last_known_vulnerabilities(self) -> None:
+        known = [{"title": "RCE", "fixed_in": None}, {"title": "XSS", "fixed_in": "9.0"}]
+        assert resolve_active_vulns(self._audit(known), "3.12.2", None) == known
+
+    def test_a_successful_lookup_replaces_them(self) -> None:
+        # A real answer is authoritative, including when it says "none left".
+        stale = [{"title": "old", "fixed_in": "1.0"}]
+        assert resolve_active_vulns(self._audit(stale), "3.12.2", []) == []
+
+    def test_a_successful_lookup_is_filtered_to_the_installed_version(self) -> None:
+        fresh = [{"title": "patched", "fixed_in": "2.0"}, {"title": "open", "fixed_in": "9.0"}]
+        got = resolve_active_vulns(self._audit([]), "3.12.2", fresh)
+        assert [v["title"] for v in got] == ["open"]
+
+    def test_a_failed_lookup_on_a_brand_new_component_is_empty_not_invented(self) -> None:
+        # Nothing known yet — the honest answer is none, and `latest_source`
+        # separately marks it unknown so it cannot read as verified-clean.
+        assert resolve_active_vulns(None, "1.0.0", None) == []
+
+    def test_a_failed_lookup_on_a_previously_clean_component_stays_clean(self) -> None:
+        assert resolve_active_vulns(self._audit([]), "3.12.2", None) == []

@@ -239,6 +239,24 @@ def active_vulnerabilities(installed_version: str, vulns: list[dict]) -> list[di
     return out
 
 
+def resolve_active_vulns(
+    audit: PluginAudit | None, installed_version: str, vulns: list[dict] | None
+) -> list[dict]:
+    """Which vulnerabilities apply, given a lookup that may have failed.
+
+    `vulns is None` means the lookup failed or was skipped for quota. The last
+    known answer then stands: recomputing from nothing would quietly demote a
+    component from critical to merely outdated and wipe its CVE list, while
+    its alert — correctly preserved elsewhere — went on saying "vulnerable".
+    The two would then disagree, and the stored row is the one the UI believes.
+    """
+    if vulns is None:
+        if audit is None:
+            return []
+        return list((audit.vulnerability_details or {}).get("vulnerabilities") or [])
+    return active_vulnerabilities(installed_version, vulns)
+
+
 def _alert_type(component_type: str, *, vulnerable: bool) -> str:
     return f"{component_type}_{'vulnerable' if vulnerable else 'outdated'}"
 
@@ -577,9 +595,12 @@ class PluginAuditor(BaseAgent):
         audits_by_key: dict[tuple[str, str], PluginAudit],
         existing_alerts: dict[tuple[str, str], Alert],
     ) -> list[Alert]:
+        audit = audits_by_key.get(component.key)
         latest_ver, latest_source = self._resolve_latest(component, wporg_version)
-        active_vulns = active_vulnerabilities(component.version, vulns) if vulns else []
         vulns_unknown = vulns is None
+
+        active_vulns = resolve_active_vulns(audit, component.version, vulns)
+
         is_outdated = _version_lt(component.version, latest_ver)
         has_vuln = bool(active_vulns)
         # "unknown" is not a clean result, so it does not earn "low".
@@ -589,8 +610,6 @@ class PluginAuditor(BaseAgent):
             else "unknown" if latest_source == LATEST_UNKNOWN
             else "low"
         )
-
-        audit = audits_by_key.get(component.key)
         vuln_details = {"vulnerabilities": active_vulns} if active_vulns else {}
         if audit:
             audit.installed_version = component.version
