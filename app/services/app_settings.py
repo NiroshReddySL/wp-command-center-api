@@ -65,6 +65,16 @@ async def _set_value(db: AsyncSession, key: str, value: dict[str, Any]) -> None:
     await db.flush()
 
 
+async def get_json_setting(db: AsyncSession, key: str) -> dict[str, Any]:
+    """Public accessor for a free-form JSON setting — `{}` when unset."""
+    return await _get_value(db, key)
+
+
+async def set_json_setting(db: AsyncSession, key: str, value: dict[str, Any]) -> None:
+    """Public writer for a free-form JSON setting. Flushes, does not commit."""
+    await _set_value(db, key, value)
+
+
 async def get_agent_toggles(db: AsyncSession) -> dict[str, bool]:
     return merge_agent_toggles(await _get_value(db, AGENT_TOGGLES_KEY))
 

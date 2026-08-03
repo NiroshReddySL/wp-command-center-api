@@ -1,6 +1,7 @@
 """Plugin Audit — checks outdated plugins and CVEs via WPScan Vulnerability Database."""
 import asyncio
 import logging
+import re
 
 import httpx
 from sqlalchemy import delete, select
@@ -244,8 +245,10 @@ class PluginAuditor(BaseAgent):
                 current = existing_alerts.get((slug, alert_type))
                 if desired and desired[0] == alert_type:
                     if current:
-                        current.severity, current.title = desired[1], desired[2]
-                        current.description, current.metadata_ = desired[3], desired[4]
+                        await self.update_alert(
+                            current, severity=desired[1], title=desired[2],
+                            description=desired[3], metadata=desired[4],
+                        )
                     else:
                         alert = await self.create_alert(
                             site_id=site_id,
@@ -274,17 +277,42 @@ class PluginAuditor(BaseAgent):
         return alerts
 
 
-def _version_lt(v1: str, v2: str) -> bool:
-    """Return True if v1 < v2 using simple numeric tuple comparison."""
-    def parts(v: str) -> tuple[int, ...]:
-        try:
-            return tuple(int(x) for x in v.split(".") if x.isdigit())
-        except Exception:
-            return (0,)
+_VERSION_SEGMENT = re.compile(r"(\d+)(.*)")
 
-    p1, p2 = parts(v1), parts(v2)
-    # Pad to same length
-    length = max(len(p1), len(p2))
-    p1 += (0,) * (length - len(p1))
-    p2 += (0,) * (length - len(p2))
-    return p1 < p2
+
+def _parse_version(v: str) -> tuple[tuple[int, ...], str]:
+    """Split a version into (release numbers, prerelease suffix).
+
+    "2.0.0-rc1" -> ((2, 0, 0), "rc1"). The suffix has to be kept rather than
+    discarded: dropping it made "2.0.0-rc1" parse as (2, 0) and then pad back
+    to (2, 0, 0) — identical to the stable 2.0.0, so a site running a release
+    candidate reported as perfectly up to date.
+    """
+    release: list[int] = []
+    suffix = ""
+    for raw in (v or "").strip().lstrip("vV").split("."):
+        match = _VERSION_SEGMENT.match(raw)
+        if not match:
+            suffix = suffix or raw
+            break
+        release.append(int(match.group(1)))
+        rest = match.group(2)
+        if rest:
+            suffix = rest.lstrip("-_.+")
+            break
+    return tuple(release), suffix.lower()
+
+
+def _version_lt(v1: str, v2: str) -> bool:
+    """Return True if v1 is strictly older than v2."""
+    r1, s1 = _parse_version(v1)
+    r2, s2 = _parse_version(v2)
+    length = max(len(r1), len(r2))
+    r1 += (0,) * (length - len(r1))
+    r2 += (0,) * (length - len(r2))
+    if r1 != r2:
+        return r1 < r2
+    # Same release numbers: a prerelease sorts BELOW the final release.
+    if bool(s1) != bool(s2):
+        return bool(s1)
+    return s1 < s2

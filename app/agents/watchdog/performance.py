@@ -46,7 +46,14 @@ async def _fetch_psi(
             what=f"PSI {url}",
         )
         if resp.status_code != 200:
-            logger.warning("PSI returned HTTP %d for %s — using TTFB fallback", resp.status_code, url)
+            hint = (
+                " (quota — set PSI_API_KEY to raise the keyless ~25 req/100s limit)"
+                if resp.status_code == 429 else ""
+            )
+            logger.warning(
+                "PSI returned HTTP %d for %s%s — using TTFB fallback",
+                resp.status_code, url, hint,
+            )
             return None
         data = resp.json()
         cats = data.get("lighthouseResult", {}).get("categories", {})
@@ -74,7 +81,10 @@ async def _fetch_psi(
             "fid": fid,
             "ttfb": ttfb,
         }
-    except Exception:
+    except Exception as exc:
+        # Silent here meant the score quietly became a TTFB estimate with no
+        # way to find out why — PSI throttling looks identical to a parse bug.
+        logger.warning("PSI lookup failed for %s (%s) — using TTFB fallback", url, exc)
         return None
 
 
@@ -184,6 +194,9 @@ class PerformanceMonitor(BaseAgent):
         )
 
         alerts: list[Alert] = []
+        # URLs actually verified this run. Only these may be reconciled — see
+        # the note where stale alerts are resolved.
+        measured: set[str] = set()
         semaphore = asyncio.Semaphore(2)  # PSI rate-limit friendly
 
         # ── Phase 1: measurements — concurrent, one pooled client ────────────
@@ -208,12 +221,14 @@ class PerformanceMonitor(BaseAgent):
 
         # ── Phase 2: DB writes — sequential (AsyncSession is not concurrency-safe)
         async def upsert_alert(url: str, severity: str, title: str, description: str, meta: dict) -> None:
-            title = title[:500]  # column is String(512); a long page URL must not fail the flush
             current = existing_by_url.pop(url, None)
             if current:
-                # Dismissed/acknowledged status and created_at survive; no re-notify
-                current.severity, current.title = severity, title
-                current.description, current.metadata_ = description, meta
+                # Dismissed/acknowledged status and created_at survive, but a
+                # climb into "critical" still notifies.
+                await self.update_alert(
+                    current, severity=severity, title=title,
+                    description=description, metadata=meta,
+                )
             else:
                 alerts.append(await self.create_alert(
                     site_id=site_id, agent="watchdog", severity=severity,
@@ -222,6 +237,7 @@ class PerformanceMonitor(BaseAgent):
 
         for m in measurements:
             url = m["url"]
+            measured.add(url)
 
             if m["error"] is not None:
                 await upsert_alert(
@@ -291,10 +307,20 @@ class PerformanceMonitor(BaseAgent):
                 if current:
                     stale_ids.append(current.id)
 
-        # Alerts for pages no longer in the measured top set are stale
-        stale_ids += [a.id for a in existing_by_url.values()]
+        # Alerts for pages this run did NOT measure are deliberately left
+        # alone. The measured set is only the homepage plus the top 3 posts by
+        # traffic, so that ranking shifts constantly — deleting the leftovers
+        # meant a page's real performance alert vanished the moment a busier
+        # post displaced it, with nothing actually fixed. LinkChecker already
+        # holds this line ("a link we didn't verify is not fixed"); the two
+        # agents disagreeing was the bug.
         if stale_ids:
             await self.db.execute(delete(Alert).where(Alert.id.in_(set(stale_ids))))
 
+        logger.info(
+            "PerformanceMonitor %s: measured %d/%d pages, %d alert(s) kept for pages "
+            "not measured this run",
+            site.url, len(measured), len(urls), len(existing_by_url),
+        )
         await self.db.flush()
         return alerts

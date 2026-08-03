@@ -9,6 +9,9 @@ from app.database.models import Alert, Site
 
 logger = logging.getLogger(__name__)
 
+# Alert.title is String(512); a long page URL must never fail the flush.
+_TITLE_MAX = 500
+
 
 class BaseAgent(ABC):
     def __init__(self, db: AsyncSession) -> None:
@@ -29,7 +32,7 @@ class BaseAgent(ABC):
             agent=agent,
             severity=severity,
             type=type_,
-            title=title,
+            title=title[:_TITLE_MAX],
             description=description,
             metadata_=metadata or {},
             status="open",
@@ -40,6 +43,37 @@ class BaseAgent(ABC):
         if severity == "critical":
             await self._notify(alert)
 
+        return alert
+
+    async def update_alert(
+        self,
+        alert: Alert,
+        *,
+        severity: str,
+        title: str,
+        description: str,
+        metadata: dict[str, Any] | None = None,
+    ) -> Alert:
+        """Refresh an existing alert in place, notifying if it just escalated.
+
+        Updating in place rather than recreating is deliberate: `created_at`
+        keeps meaning "first seen", and an acknowledged or dismissed status
+        survives so triaged findings don't resurrect on every run.
+
+        But severity is not cosmetic. A link going 500 -> 404, or a page
+        degrading past the critical threshold, is exactly the transition
+        someone asked to be told about — and it passed silently, because
+        notification lived only in `create_alert` and every agent mutated
+        `.severity` directly.
+        """
+        escalated = severity == "critical" and alert.severity != "critical"
+        alert.severity = severity
+        alert.title = title[:_TITLE_MAX]
+        alert.description = description
+        if metadata is not None:
+            alert.metadata_ = metadata
+        if escalated:
+            await self._notify(alert)
         return alert
 
     async def _notify(self, alert: Alert) -> None:

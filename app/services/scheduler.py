@@ -23,8 +23,13 @@ scheduler = AsyncIOScheduler(timezone="UTC")
 
 
 async def _active_site_ids() -> list[str]:
+    """Every monitored site — see `site_scope`. Deliberately NOT
+    `status == "active"`: that excluded any site whose last content sync
+    failed, which is the one state where monitoring matters most."""
+    from app.services.site_scope import select_monitored_site_ids
+
     async with AsyncSessionLocal() as db:
-        result = await db.execute(select(Site.id).where(Site.status == "active"))
+        result = await db.execute(select_monitored_site_ids())
         return [row[0] for row in result.all()]
 
 
@@ -183,8 +188,12 @@ async def _send_weekly_digest() -> None:
         webhook_url = prefs["teams_webhook_url"] or app_config.TEAMS_WEBHOOK_URL
         if not webhook_url or not prefs["weekly_digest"]:
             return
+        from app.services.site_scope import monitored
+
+        # Same scope as the agent runs: a site whose sync failed still has a
+        # health score worth reporting — omitting it hides the bad news.
         result = await db.execute(
-            select(Site.name, Site.health_score).where(Site.status == "active").order_by(Site.name)
+            select(Site.name, Site.health_score).where(monitored()).order_by(Site.name)
         )
         site_rows = [(name, round(score or 0)) for name, score in result.all()]
     if not site_rows:

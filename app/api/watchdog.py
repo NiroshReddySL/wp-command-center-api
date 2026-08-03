@@ -4,7 +4,7 @@ from typing import Any
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
 from pydantic import BaseModel
-from sqlalchemy import delete, func, select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.engine import AsyncSessionLocal, get_db
@@ -12,6 +12,10 @@ from app.database.models import Alert, Site
 from app.security.rate_limit import job_limiter
 
 router = APIRouter()
+
+# Where the last re-run outcome is stored, so a failed background run is
+# visible in the UI instead of surfacing as an empty "all healthy" list.
+_RUN_STATUS_KEY = "watchdog.last_run"
 
 
 class AlertResponse(BaseModel):
@@ -63,7 +67,9 @@ async def list_alerts(
     else:
         query = query.where(Alert.status.in_(["open", "acknowledged"]))
     if type:
-        query = query.where(Alert.type.contains(type))
+        # autoescape: `_` and `%` are LIKE wildcards, and this value comes
+        # straight from the client — `type=_` matched every alert.
+        query = query.where(Alert.type.contains(type, autoescape=True))
 
     result = await db.execute(query)
     rows = result.all()
@@ -158,24 +164,30 @@ class FlushRequest(BaseModel):
     module: str | None = None  # "links" | "performance" | "plugins" | None (all)
 
 
-TYPE_PREFIXES: dict[str, str] = {
-    "links": "broken_link",
-    "performance": "performance",
-    "plugins": "plugin",
-}
-
-
 async def _run_watchdog(site_id: str | None, module: str | None) -> None:
+    """Re-run the watchdog agents and record the outcome.
+
+    Nothing is deleted up front. Each agent already reconciles its own alerts
+    (create / update in place / delete what it verified as fixed), so a
+    pre-emptive delete only destroyed `created_at`, acknowledgements and
+    dismissals — and, when the re-run then failed, left the page reporting
+    "no issues found" as though the sites were healthy.
+    """
     import logging
 
     from app.agents.watchdog.link_checker import LinkChecker
     from app.agents.watchdog.performance import PerformanceMonitor
     from app.agents.watchdog.plugin_audit import PluginAuditor
+    from app.services.job_executor import AGENT_TIMEOUTS
+    from app.services.site_scope import select_monitored_sites
 
     logger = logging.getLogger(__name__)
 
+    failures: list[str] = []
+    ran = 0
+
     async with AsyncSessionLocal() as db:
-        result = await db.execute(select(Site).where(Site.status != "inactive"))
+        result = await db.execute(select_monitored_sites())
         sites = result.scalars().all()
         if site_id:
             sites = [s for s in sites if s.id == site_id]
@@ -186,34 +198,70 @@ async def _run_watchdog(site_id: str | None, module: str | None) -> None:
             "plugins": [PluginAuditor],
         }
         agent_classes = agents_map.get(module or "", [LinkChecker, PerformanceMonitor, PluginAuditor])
-        # Bounded per agent — a hung crawl must not stall the whole re-run
-        timeouts = {"LinkChecker": 600, "PerformanceMonitor": 300, "PluginAuditor": 180}
 
         for site in sites:
             for AgentClass in agent_classes:
+                name = AgentClass.__name__
                 try:
                     agent = AgentClass(db)
+                    # Bounded per agent — a hung crawl must not stall the re-run
                     await asyncio.wait_for(
-                        agent.run(site.id), timeout=timeouts.get(AgentClass.__name__, 300)
+                        agent.run(site.id), timeout=AGENT_TIMEOUTS.get(name, 300)
                     )
                     # Commit per agent so one failure doesn't discard the rest,
                     # and so re-run results actually persist (BaseAgent only flushes).
                     await db.commit()
+                    ran += 1
                 except Exception as exc:
                     await db.rollback()
-                    logger.warning("Watchdog %s failed for site %s: %s", AgentClass.__name__, site.id, exc)
+                    failures.append(f"{name} on {site.name}: {exc}")
+                    logger.warning("Watchdog %s failed for site %s: %s", name, site.id, exc)
+
+        await _record_run(db, ran=ran, failures=failures)
+        await db.commit()
+
+
+async def _record_run(db: AsyncSession, *, ran: int, failures: list[str]) -> None:
+    """Persist the last re-run outcome so a failed background run is visible.
+
+    Without this the only trace of a failure was a server-side log line, and
+    the UI rendered an empty alert list as "Your sites are healthy."
+    """
+    from app.services.app_settings import set_json_setting
+
+    await set_json_setting(
+        db,
+        _RUN_STATUS_KEY,
+        {
+            "finished_at": datetime.now(UTC).isoformat(),
+            "agents_succeeded": ran,
+            # Bounded: this is a status banner, not a log sink.
+            "failures": failures[:10],
+            "failure_count": len(failures),
+        },
+    )
+
+
+@router.get("/last-run")
+async def last_run(db: AsyncSession = Depends(get_db)) -> dict[str, Any]:
+    """Outcome of the most recent re-run, so the UI can distinguish
+    "genuinely healthy" from "the re-run crashed"."""
+    from app.services.app_settings import get_json_setting
+
+    return await get_json_setting(db, _RUN_STATUS_KEY)
 
 
 @router.post("/flush", dependencies=[Depends(job_limiter)])
-async def flush_watchdog(req: FlushRequest, background_tasks: BackgroundTasks, db: AsyncSession = Depends(get_db)) -> dict[str, str]:
-    # Delete matching alerts
-    query = delete(Alert).where(Alert.agent == "watchdog")
-    if req.site_id:
-        query = query.where(Alert.site_id == req.site_id)
-    if req.module and req.module in TYPE_PREFIXES:
-        query = query.where(Alert.type.contains(TYPE_PREFIXES[req.module]))
-    await db.execute(query)
-    await db.flush()
+async def flush_watchdog(
+    req: FlushRequest, background_tasks: BackgroundTasks, db: AsyncSession = Depends(get_db)
+) -> dict[str, str]:
+    """Re-run the watchdog agents against current reality.
 
+    Deliberately non-destructive: the agents reconcile their own alerts, so
+    existing rows keep their first-seen time and their acknowledged/dismissed
+    state, and a re-run that fails leaves the previous findings on screen
+    instead of replacing them with a false all-clear.
+    """
+    await _record_run(db, ran=0, failures=[])  # clears the previous banner
     background_tasks.add_task(_run_watchdog, req.site_id, req.module)
-    return {"status": "flushed", "message": "Re-running watchdog in background"}
+    return {"status": "running", "message": "Re-running watchdog in background"}

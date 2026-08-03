@@ -43,8 +43,15 @@ class _LinkExtractor(HTMLParser):
                     self.links.append(val)
 
 
-def _resolve_href(href: str, base_url: str) -> str | None:
-    """Absolute http(s) URL with fragment stripped, or None if uncheckable."""
+def _resolve_href(href: str, base_url: str, page_url: str | None = None) -> str | None:
+    """Absolute http(s) URL with fragment stripped, or None if uncheckable.
+
+    `base_url` is the site root (for root-relative hrefs); `page_url` is the
+    document the href was found on, which is what a *document*-relative href
+    like "../pricing/" or "setup" actually resolves against per the HTML spec.
+    Resolving those against the site root instead produced confident 404s for
+    links that work perfectly in a browser.
+    """
     href = href.strip()
     if not href:
         return None
@@ -54,7 +61,11 @@ def _resolve_href(href: str, base_url: str) -> str | None:
     elif href.startswith("/"):
         href = f"{base_url}{href}"
     elif not href.startswith(("http://", "https://")):
-        href = urljoin(base_url + "/", href)
+        # A directory-style page URL ("/blog/post/") is its own base; anything
+        # else falls back to the site root, which is the old behaviour and the
+        # right answer when we don't know the containing document.
+        anchor = page_url if page_url and page_url.startswith(("http://", "https://")) else base_url + "/"
+        href = urljoin(anchor, href)
     parsed = urlparse(href)
     if parsed.scheme not in ("http", "https") or not parsed.netloc:
         return None
@@ -75,6 +86,12 @@ _BROWSER_HEADERS = {
 # servers that simply dislike HEAD/automated requests. A real user's browser
 # opens these fine, so they must NOT be reported as broken links.
 _REACHABLE_STATUSES = frozenset({401, 403, 405, 406, 408, 409, 429, 451, 503, 999})
+
+# ...except on your own domain. An internal page answering 401/403 is not a
+# bot-protection quirk, it is a page your readers cannot open — a lost login
+# wall or a post flipped back to private. External hosts keep the benefit of
+# the doubt, because there a 403 usually is just Cloudflare disliking us.
+_INTERNAL_BROKEN_STATUSES = frozenset({401, 403})
 
 
 async def _get_status_streaming(client: httpx.AsyncClient, url: str) -> int:
@@ -117,6 +134,8 @@ async def _check_url(client: httpx.AsyncClient, url: str, retries: int = 2) -> i
 
 def _classify(status: int, is_internal: bool) -> str | None:
     """Map a status to 'critical' / 'warning' / None (not broken)."""
+    if is_internal and status in _INTERNAL_BROKEN_STATUSES:
+        return "warning"
     if status in _REACHABLE_STATUSES:
         return None
     if 200 <= status < 400:
@@ -176,7 +195,7 @@ class LinkChecker(BaseAgent):
             parser = _LinkExtractor()
             parser.feed(html)
             for href in parser.links:
-                clean = _resolve_href(href, base_url)
+                clean = _resolve_href(href, base_url, found_on or None)
                 if clean is None:
                     continue
                 links_map.setdefault(clean, set())
@@ -258,10 +277,14 @@ class LinkChecker(BaseAgent):
             return title, description, meta
 
         for url in to_update:
-            alert = existing_by_url[url][0]
-            alert.title, alert.description, alert.metadata_ = _fields(url)
-            alert.severity = broken[url][3]
-            # status (open/acknowledged/dismissed) and created_at survive on purpose
+            title, description, meta = _fields(url)
+            # update_alert notifies if this just escalated (e.g. 500 -> 404);
+            # status (open/acknowledged/dismissed) and created_at survive.
+            await self.update_alert(
+                existing_by_url[url][0],
+                severity=broken[url][3], title=title,
+                description=description, metadata=meta,
+            )
 
         alerts: list[Alert] = []
         for url in sorted(to_create):
