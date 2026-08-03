@@ -254,8 +254,18 @@ class VulnerabilityCache(Base):
     # The raw vulnerability list. An empty list is a real answer — "WPScan
     # knows this component and it has none" — and is not the same as no row.
     vulnerabilities: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=False)
-    fetched_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now(), nullable=False
+    # When an answer was last successfully retrieved. NULL means every attempt
+    # so far has failed, so `vulnerabilities` is a placeholder and not an
+    # answer — distinct from an empty list, which is a real "none known".
+    fetched_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    # When it was last *tried*, successfully or not. This is what the refresh
+    # queue orders by: without it a component that keeps failing stays at the
+    # front forever, spending the daily allowance every run and starving
+    # everything behind it.
+    last_attempt_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
     )
 
     __table_args__ = (

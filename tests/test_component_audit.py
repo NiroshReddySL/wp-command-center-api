@@ -24,6 +24,7 @@ from app.agents.watchdog.plugin_audit import (
     _version_lt,
     active_vulnerabilities,
     plugin_component,
+    refresh_budget,
     resolve_active_vulns,
     theme_component,
 )
@@ -376,3 +377,53 @@ class TestUnknownDoesNotClearAKnownFinding:
 
     def test_a_failed_lookup_on_a_previously_clean_component_stays_clean(self) -> None:
         assert resolve_active_vulns(self._audit([]), "3.12.2", None) == []
+
+
+class TestRefreshBudget:
+    """WPScan's free allowance is 25/day against far more components, and it
+    does not carry over. The budget therefore has to bound a run without
+    leaving quota unspent — and without one run swallowing the whole day."""
+
+    def test_never_exceeds_what_the_allowance_has_left(self) -> None:
+        assert refresh_budget(5, candidates=100, max_per_run=8, reserve=2) == 3
+
+    def test_never_exceeds_the_per_run_cap(self) -> None:
+        # Four scheduled sweeps a day: without this the first takes everything
+        # and the rest — including a manual re-run — get nothing.
+        assert refresh_budget(25, candidates=100, max_per_run=8, reserve=2) == 8
+
+    def test_never_exceeds_what_there_is_to_do(self) -> None:
+        assert refresh_budget(25, candidates=3, max_per_run=8, reserve=2) == 3
+
+    def test_an_exhausted_allowance_spends_nothing(self) -> None:
+        assert refresh_budget(2, candidates=50, max_per_run=8, reserve=2) == 0
+        assert refresh_budget(0, candidates=50, max_per_run=8, reserve=2) == 0
+
+    def test_reserve_is_genuinely_spendable_headroom(self) -> None:
+        # Regression: reserve 5 with 25/day meant that once the sweep had run,
+        # remaining == reserve and EVERY later run got 0 — the reserve
+        # protected quota that nothing could then spend.
+        from app.config import settings
+
+        assert settings.WPSCAN_QUOTA_RESERVE < settings.WPSCAN_MAX_PER_RUN
+
+    def test_an_unreadable_allowance_falls_back_to_the_per_run_cap(self) -> None:
+        # Conservative: don't drain an allowance we can't see.
+        assert refresh_budget(None, candidates=100, max_per_run=8, reserve=2) == 8
+
+    def test_a_days_sweeps_stay_inside_the_free_allowance(self) -> None:
+        from app.config import settings
+
+        remaining, spent = 25, 0
+        for _ in range(4):  # the scheduler sweeps every 6 hours
+            b = refresh_budget(
+                remaining, candidates=100,
+                max_per_run=settings.WPSCAN_MAX_PER_RUN,
+                reserve=settings.WPSCAN_QUOTA_RESERVE,
+            )
+            remaining -= b
+            spent += b
+        assert spent <= 25
+        assert spent > 0
+        # And some is left for a re-run triggered by hand.
+        assert remaining >= settings.WPSCAN_QUOTA_RESERVE

@@ -239,6 +239,21 @@ def active_vulnerabilities(installed_version: str, vulns: list[dict]) -> list[di
     return out
 
 
+def refresh_budget(
+    remaining: int | None, candidates: int, *, max_per_run: int, reserve: int
+) -> int:
+    """How many WPScan lookups this run may spend.
+
+    Three bounds, all of which must hold: what the allowance actually has
+    left (minus headroom), what any single run is permitted, and how many
+    components could use one. `remaining is None` means the allowance could
+    not be read, in which case the per-run cap alone applies — conservative
+    enough not to drain an allowance we cannot see.
+    """
+    spendable = max_per_run if remaining is None else max(0, remaining - reserve)
+    return max(0, min(spendable, max_per_run, candidates))
+
+
 def resolve_active_vulns(
     audit: PluginAudit | None, installed_version: str, vulns: list[dict] | None
 ) -> list[dict]:
@@ -455,11 +470,17 @@ class PluginAuditor(BaseAgent):
         vulnerability along with the version it was fixed in, so one answer
         serves every site and survives upgrades.
 
-        Refreshes are bounded by what the API says is actually left today,
-        rather than by a guess. When the allowance runs out, a stale cached
-        answer is used in preference to nothing — week-old vulnerability data
-        is vastly better than reporting "unknown" — and only components that
-        have never been fetched fall back to unknown.
+        Coverage is achieved by rotation rather than by doing everything at
+        once. The free allowance is 25 requests a day against far more
+        components than that, so each run refreshes a bounded slice of the
+        queue — least-recently-attempted first — and the rest carry over.
+        Every component therefore comes round in a few days and is re-checked
+        about weekly, continuously, without any run ever exceeding the
+        allowance.
+
+        Ordering is by last ATTEMPT, not last success. Ordering by success
+        would leave a component that consistently fails permanently at the
+        front, spending budget on every run and starving everything behind it.
         """
         key = settings.WPSCAN_API_KEY
         if not key:
@@ -473,34 +494,47 @@ class PluginAuditor(BaseAgent):
         cached = {(r.component_type, r.slug): r for r in rows}
 
         cutoff = datetime.now(UTC) - timedelta(hours=settings.WPSCAN_CACHE_TTL_HOURS)
-        never_fetched = [c for c in components if c.key not in cached]
-        stale = [
-            c for c in components
-            if c.key in cached and cached[c.key].fetched_at < cutoff
-        ]
-        # Never-fetched first: an unknown component is a real gap, whereas a
-        # stale one still has an answer.
-        candidates = never_fetched + sorted(
-            stale, key=lambda c: cached[c.key].fetched_at
-        )
+
+        def needs_refresh(component: Component) -> bool:
+            row = cached.get(component.key)
+            # No row, or tried but never answered, or the answer has aged out.
+            return row is None or row.fetched_at is None or row.fetched_at < cutoff
+
+        far_past = datetime.min.replace(tzinfo=UTC)
+
+        def last_tried(component: Component) -> datetime:
+            row = cached.get(component.key)
+            return (row.last_attempt_at if row else None) or far_past
+
+        # Two bands, each least-recently-attempted first. Everything is a
+        # candidate, not just what has aged out: the daily allowance resets
+        # and does NOT carry over, so quota left unspent is simply lost. Once
+        # the urgent band is served, the remainder goes on keeping the rest
+        # fresh — which turns a weekly refresh into a rolling one at no extra
+        # cost. Recently-checked components sort last and so come round only
+        # after everything else has.
+        overdue = sorted((c for c in components if needs_refresh(c)), key=last_tried)
+        rest = sorted((c for c in components if not needs_refresh(c)), key=last_tried)
+        candidates = overdue + rest
 
         budget = 0
         if candidates:
             quota = await fetch_quota(client, key)
-            if quota is None:
-                # Couldn't read the allowance — refresh conservatively rather
-                # than risk burning it all in one run.
-                budget = min(len(candidates), 5)
-            else:
-                budget = max(0, quota.remaining - settings.WPSCAN_QUOTA_RESERVE)
-                logger.info(
-                    "WPScan quota: %d/%d left, %d component(s) need refreshing, "
-                    "refreshing %d this run",
-                    quota.remaining, quota.limit, len(candidates),
-                    min(budget, len(candidates)),
-                )
+            budget = refresh_budget(
+                quota.remaining if quota else None, len(candidates),
+                max_per_run=settings.WPSCAN_MAX_PER_RUN,
+                reserve=settings.WPSCAN_QUOTA_RESERVE,
+            )
+            logger.info(
+                "WPScan rotation: %d overdue of %d tracked, spending %d this "
+                "run (%s), next %d carry over",
+                len(overdue), len(components), budget,
+                f"{quota.remaining}/{quota.limit} left today" if quota else "quota unknown",
+                max(0, len(overdue) - budget),
+            )
 
         auth_failed = False
+        now = datetime.now(UTC)
         for component in candidates[:budget]:
             result = await fetch_vulnerabilities(
                 client, component.slug, component.component_type, key
@@ -508,32 +542,28 @@ class PluginAuditor(BaseAgent):
             if result.auth_failed:
                 auth_failed = True
                 break  # every subsequent call fails identically — stop
-            if result.vulns is None:
-                continue  # transient: keep whatever the cache already holds
+
             row = cached.get(component.key)
-            if row:
-                row.vulnerabilities = result.vulns
-                row.fetched_at = datetime.now(UTC)
-            else:
+            if row is None:
                 row = VulnerabilityCache(
-                    component_type=component.component_type,
-                    slug=component.slug,
-                    vulnerabilities=result.vulns,
+                    component_type=component.component_type, slug=component.slug
                 )
                 self.db.add(row)
                 cached[component.key] = row
+            # Recorded even on failure, so this component moves to the BACK of
+            # the queue and cannot block the ones behind it next run.
+            row.last_attempt_at = now
+            if result.vulns is not None:
+                row.vulnerabilities = result.vulns
+                row.fetched_at = now
 
-        if candidates and len(candidates) > budget:
-            logger.info(
-                "WPScan: %d component(s) left for a later run (daily allowance)",
-                len(candidates) - budget,
-            )
+        # Only a successful fetch is an answer. A row that exists purely
+        # because of failed attempts still reports unknown.
+        def answer(component: Component) -> list[dict] | None:
+            row = cached.get(component.key)
+            return row.vulnerabilities if row and row.fetched_at else None
 
-        return (
-            {c.key: (cached[c.key].vulnerabilities if c.key in cached else None)
-             for c in components},
-            auth_failed,
-        )
+        return {c.key: answer(c) for c in components}, auth_failed
 
     # ── Alerts ───────────────────────────────────────────────────────────────
 

@@ -20,9 +20,15 @@ class Settings(BaseSettings):
     # A week means each component refreshes roughly once per week, spread
     # across runs, which fits comfortably inside the allowance.
     WPSCAN_CACHE_TTL_HOURS: int = 168
-    # Requests held back from the daily allowance so a re-run triggered by
-    # hand is never starved by the scheduled sweep.
-    WPSCAN_QUOTA_RESERVE: int = 5
+    # Most one run may spend. The scheduler sweeps every 6 hours, so without
+    # a cap the first run of the day takes the entire allowance and the other
+    # three — and any re-run triggered by hand — get nothing. Capping spreads
+    # the same total across the day instead of burning it in one burst.
+    WPSCAN_MAX_PER_RUN: int = 8
+    # Headroom left unspent, so an allowance that is nearly gone still leaves
+    # room for the /status checks themselves and for retries. Deliberately
+    # small: a large reserve is quota that nothing can ever spend.
+    WPSCAN_QUOTA_RESERVE: int = 2
     # Google PageSpeed Insights API key — optional; raises the quota from
     # ~25 req/100s (per IP, keyless) to 25k/day so perf checks stop flaking.
     PSI_API_KEY: str = ""

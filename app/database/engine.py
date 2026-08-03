@@ -219,6 +219,13 @@ EXTRA_DDL: list[str] = [
             # Where latest_version came from — "up to date" is only meaningful
             # when something actually resolved it.
             "ALTER TABLE plugin_audits ADD COLUMN IF NOT EXISTS latest_source VARCHAR(10) NOT NULL DEFAULT 'unknown'",
+            # Refresh rotation: order by when a component was last TRIED, so a
+            # persistently failing one cannot camp at the front of the queue.
+            "ALTER TABLE vulnerability_cache ADD COLUMN IF NOT EXISTS last_attempt_at TIMESTAMPTZ",
+            "ALTER TABLE vulnerability_cache ALTER COLUMN fetched_at DROP NOT NULL",
+            "ALTER TABLE vulnerability_cache ALTER COLUMN fetched_at DROP DEFAULT",
+            "UPDATE vulnerability_cache SET last_attempt_at = fetched_at WHERE last_attempt_at IS NULL",
+            "CREATE INDEX IF NOT EXISTS idx_vulnerability_cache_attempt ON vulnerability_cache(last_attempt_at)",
 ]
 
 
