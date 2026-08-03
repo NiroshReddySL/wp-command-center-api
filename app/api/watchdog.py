@@ -3,7 +3,7 @@ import re
 from datetime import UTC, datetime
 from typing import Any, Literal
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -12,6 +12,7 @@ from app.agents.watchdog.plugin_audit import _version_lt
 from app.database.engine import AsyncSessionLocal, get_db
 from app.database.models import Alert, PluginAudit, Site
 from app.security.rate_limit import job_limiter
+from app.utils.background import spawn
 
 router = APIRouter()
 
@@ -273,7 +274,7 @@ async def last_run(db: AsyncSession = Depends(get_db)) -> dict[str, Any]:
 
 @router.post("/flush", dependencies=[Depends(job_limiter)])
 async def flush_watchdog(
-    req: FlushRequest, background_tasks: BackgroundTasks, db: AsyncSession = Depends(get_db)
+    req: FlushRequest, db: AsyncSession = Depends(get_db)
 ) -> dict[str, str]:
     """Re-run the watchdog agents against current reality.
 
@@ -281,9 +282,14 @@ async def flush_watchdog(
     existing rows keep their first-seen time and their acknowledged/dismissed
     state, and a re-run that fails leaves the previous findings on screen
     instead of replacing them with a false all-clear.
+
+    Detached via `spawn` rather than Starlette's BackgroundTasks, which run
+    INSIDE the request task: a full crawl takes minutes, and uvicorn's
+    graceful shutdown waits for request tasks — so a re-run in flight would
+    wedge every restart behind "Waiting for background tasks to complete".
     """
     await _record_run(db, ran=0, failures=[])  # clears the previous banner
-    background_tasks.add_task(_run_watchdog, req.site_id, req.module)
+    spawn(_run_watchdog(req.site_id, req.module), name="watchdog-rerun")
     return {"status": "running", "message": "Re-running watchdog in background"}
 
 

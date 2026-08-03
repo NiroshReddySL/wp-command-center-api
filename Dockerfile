@@ -21,4 +21,7 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
     CMD curl -fsS http://localhost:8000/ready || exit 1
 
 # Production default — dev compose overrides this with --reload
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+# Bounded graceful shutdown: SSE streams stay open indefinitely by design, so
+# without this a rolling deploy waits on them rather than draining.
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", \
+     "--timeout-graceful-shutdown", "30"]
