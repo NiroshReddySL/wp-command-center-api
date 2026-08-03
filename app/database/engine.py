@@ -216,6 +216,9 @@ EXTRA_DDL: list[str] = [
                 END IF;
             END $$;
             """,
+            # Where latest_version came from — "up to date" is only meaningful
+            # when something actually resolved it.
+            "ALTER TABLE plugin_audits ADD COLUMN IF NOT EXISTS latest_source VARCHAR(10) NOT NULL DEFAULT 'unknown'",
 ]
 
 

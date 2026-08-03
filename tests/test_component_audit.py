@@ -9,11 +9,18 @@ audit exactly like a WordPress-read one.
 from app.agents.watchdog.plugin_audit import (
     COMPONENT_PLUGIN,
     COMPONENT_THEME,
+    LATEST_MANUAL,
+    LATEST_UNKNOWN,
+    LATEST_WPORG,
+    SOURCE_MANUAL,
     SOURCE_WORDPRESS,
     UNAVAILABLE_TYPE,
     WPSCAN_AUTH_TYPE,
+    Component,
+    PluginAuditor,
     VulnLookup,
     _status_to_active,
+    _version_lt,
     active_vulnerabilities,
     plugin_component,
     theme_component,
@@ -173,3 +180,49 @@ class TestSlugNormalisation:
 
     def test_strips_surrounding_hyphens(self) -> None:
         assert _normalize_slug("--yoast--") == "yoast"
+
+
+class TestLatestVersionResolution:
+    """`latest_version` equal to `installed_version` means two opposite
+    things, and conflating them is what made a premium plugin sit at "up to
+    date" forever: either the directory confirmed nothing newer exists, or
+    the directory has never heard of it and nobody checked.
+    """
+
+    @staticmethod
+    def _component(**over):
+        base = {
+            "component_type": COMPONENT_PLUGIN, "slug": "avada", "name": "Avada",
+            "version": "7.10.0", "is_active": True, "source": SOURCE_MANUAL,
+        }
+        base.update(over)
+        return Component(**base)
+
+    def test_directory_version_wins_when_it_exists(self) -> None:
+        latest, source = PluginAuditor._resolve_latest(self._component(), "7.11.0")
+        assert (latest, source) == ("7.11.0", LATEST_WPORG)
+
+    def test_operator_version_is_used_when_the_directory_has_none(self) -> None:
+        # Avada is sold through ThemeForest; wp.org will never answer for it.
+        c = self._component(latest_override="7.11.6")
+        latest, source = PluginAuditor._resolve_latest(c, None)
+        assert (latest, source) == ("7.11.6", LATEST_MANUAL)
+
+    def test_directory_still_outranks_an_operator_value(self) -> None:
+        # If wp.org does know the slug it is fresher than a hand-typed note.
+        c = self._component(latest_override="1.0.0")
+        latest, source = PluginAuditor._resolve_latest(c, "7.11.0")
+        assert (latest, source) == ("7.11.0", LATEST_WPORG)
+
+    def test_neither_source_marks_it_unknown_not_current(self) -> None:
+        latest, source = PluginAuditor._resolve_latest(self._component(), None)
+        # latest mirrors installed so the comparison is a deliberate no-op...
+        assert latest == "7.10.0"
+        # ...but it is flagged, so nothing can read it as "up to date".
+        assert source == LATEST_UNKNOWN
+
+    def test_a_custom_in_house_component_is_supported(self) -> None:
+        c = self._component(slug="cloudfuze-internal", latest_override="2.4.0", version="2.3.0")
+        latest, source = PluginAuditor._resolve_latest(c, None)
+        assert (latest, source) == ("2.4.0", LATEST_MANUAL)
+        assert _version_lt("2.3.0", latest) is True  # correctly reads as outdated

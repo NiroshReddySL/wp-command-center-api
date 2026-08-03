@@ -39,6 +39,13 @@ COMPONENT_TYPES = (COMPONENT_PLUGIN, COMPONENT_THEME)
 SOURCE_WORDPRESS = "wordpress"
 SOURCE_MANUAL = "manual"
 
+# Where `latest_version` came from. The distinction matters because two of
+# these three look identical in the data — latest == installed — while meaning
+# opposite things: genuinely current, versus never looked up.
+LATEST_WPORG = "wporg"
+LATEST_MANUAL = "manual"
+LATEST_UNKNOWN = "unknown"
+
 # Site-level notices, not tied to any one component.
 UNAVAILABLE_TYPE = "component_audit_unavailable"
 WPSCAN_AUTH_TYPE = "component_audit_wpscan_auth"
@@ -54,6 +61,10 @@ class Component:
     version: str
     is_active: bool | None
     source: str
+    # Set for components the WordPress.org directory does not carry — premium
+    # and custom builds — where the operator is the only possible authority on
+    # what the newest release is.
+    latest_override: str | None = None
 
     @property
     def key(self) -> tuple[str, str]:
@@ -409,6 +420,9 @@ class PluginAuditor(BaseAgent):
                 version=audit.installed_version,
                 is_active=audit.is_active,
                 source=SOURCE_MANUAL,
+                latest_override=(
+                    audit.latest_version if audit.latest_source == LATEST_MANUAL else None
+                ),
             )
 
         return list(components.values()), wp_read
@@ -417,14 +431,14 @@ class PluginAuditor(BaseAgent):
 
     async def _enrich(
         self, components: list[Component]
-    ) -> tuple[list[tuple[Component, str, list[dict] | None]], bool]:
+    ) -> tuple[list[tuple[Component, str | None, list[dict] | None]], bool]:
         wpscan_key = settings.WPSCAN_API_KEY
         semaphore = asyncio.Semaphore(5)
         auth_failed = False
 
         async def lookup(
             client: httpx.AsyncClient, component: Component
-        ) -> tuple[Component, str, list[dict] | None]:
+        ) -> tuple[Component, str | None, list[dict] | None]:
             nonlocal auth_failed
             async with semaphore:
                 if wpscan_key:
@@ -441,9 +455,10 @@ class PluginAuditor(BaseAgent):
                     vuln = VulnLookup(None)
                 if vuln.auth_failed:
                     auth_failed = True
-                # A failed wp.org lookup must not read as "outdated" — fall
-                # back to the installed version so the comparison is a no-op.
-                return component, latest or component.version, vuln.vulns
+                # `latest` stays None on a failed lookup. Substituting the
+                # installed version here is what made an unlisted component
+                # compare equal and report as up to date.
+                return component, latest, vuln.vulns
 
         async with httpx.AsyncClient(
             timeout=10.0,
@@ -488,26 +503,50 @@ class PluginAuditor(BaseAgent):
         if alert_ids:
             await self.db.execute(delete(Alert).where(Alert.id.in_(set(alert_ids))))
 
+    @staticmethod
+    def _resolve_latest(component: Component, wporg_version: str | None) -> tuple[str, str]:
+        """(latest_version, latest_source).
+
+        Order matters. The directory is authoritative when it has a record.
+        Otherwise an operator-supplied version wins, because for a premium or
+        custom component they are the only possible authority. Failing both,
+        latest mirrors installed and is flagged `unknown` — the comparison is
+        then a deliberate no-op rather than a claim that it is current.
+        """
+        if wporg_version:
+            return wporg_version, LATEST_WPORG
+        if component.latest_override:
+            return component.latest_override, LATEST_MANUAL
+        return component.version, LATEST_UNKNOWN
+
     async def _apply(
         self,
         site_id: str,
         component: Component,
-        latest_ver: str,
+        wporg_version: str | None,
         vulns: list[dict] | None,
         audits_by_key: dict[tuple[str, str], PluginAudit],
         existing_alerts: dict[tuple[str, str], Alert],
     ) -> list[Alert]:
+        latest_ver, latest_source = self._resolve_latest(component, wporg_version)
         active_vulns = active_vulnerabilities(component.version, vulns) if vulns else []
         vulns_unknown = vulns is None
         is_outdated = _version_lt(component.version, latest_ver)
         has_vuln = bool(active_vulns)
-        risk = "critical" if has_vuln else ("high" if is_outdated else "low")
+        # "unknown" is not a clean result, so it does not earn "low".
+        risk = (
+            "critical" if has_vuln
+            else "high" if is_outdated
+            else "unknown" if latest_source == LATEST_UNKNOWN
+            else "low"
+        )
 
         audit = audits_by_key.get(component.key)
         vuln_details = {"vulnerabilities": active_vulns} if active_vulns else {}
         if audit:
             audit.installed_version = component.version
             audit.latest_version = latest_ver
+            audit.latest_source = latest_source
             audit.risk_level = risk
             audit.plugin_name = component.name
             audit.vulnerability_details = vuln_details
@@ -524,6 +563,7 @@ class PluginAuditor(BaseAgent):
                 component_type=component.component_type,
                 installed_version=component.version,
                 latest_version=latest_ver,
+                latest_source=latest_source,
                 risk_level=risk,
                 vulnerability_details=vuln_details,
                 is_active=component.is_active,
@@ -549,7 +589,7 @@ class PluginAuditor(BaseAgent):
                        else "No patch available yet.")
                     + state + origin
                 ),
-                self._meta(component, latest_ver,
+                self._meta(component, latest_ver, latest_source,
                            vuln_count=len(active_vulns), vulnerability=active_vulns[0]),
             )
         elif is_outdated:
@@ -560,7 +600,7 @@ class PluginAuditor(BaseAgent):
                     f"v{component.version} installed, v{latest_ver} available. "
                     "Update for security patches and bug fixes." + state + origin
                 ),
-                self._meta(component, latest_ver),
+                self._meta(component, latest_ver, latest_source),
             )
         else:
             desired = None
@@ -593,7 +633,7 @@ class PluginAuditor(BaseAgent):
 
     @staticmethod
     def _meta(
-        component: Component, latest_ver: str, *,
+        component: Component, latest_ver: str, latest_source: str, *,
         vuln_count: int = 0, vulnerability: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         meta: dict[str, Any] = {
@@ -602,6 +642,7 @@ class PluginAuditor(BaseAgent):
             "component_type": component.component_type,
             "installed_version": component.version,
             "latest_version": latest_ver,
+            "latest_source": latest_source,
             "is_active": component.is_active,
             "source": component.source,
         }

@@ -202,6 +202,15 @@ class PluginAudit(Base):
     component_type: Mapped[str] = mapped_column(String(10), default="plugin", nullable=False)
     installed_version: Mapped[str] = mapped_column(String(50), nullable=False)
     latest_version: Mapped[str] = mapped_column(String(50), nullable=False)
+    # Where latest_version came from, which decides whether "up to date" is a
+    # finding or an absence of one:
+    #   "wporg"   — resolved from the WordPress.org directory
+    #   "manual"  — the operator supplied it (premium/custom components that
+    #               the directory has never heard of: Avada, Swift Performance,
+    #               anything built in-house)
+    #   "unknown" — not in the directory and nobody has said. latest_version
+    #               mirrors installed, so it must NOT be read as current.
+    latest_source: Mapped[str] = mapped_column(String(10), default="unknown", nullable=False)
     risk_level: Mapped[str] = mapped_column(String(20), default="low", nullable=False)
     vulnerability_details: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
     # NULL means "not known" rather than "inactive". WordPress reports this;

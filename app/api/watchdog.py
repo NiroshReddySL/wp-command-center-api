@@ -8,7 +8,13 @@ from pydantic import BaseModel, Field
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.agents.watchdog.plugin_audit import _version_lt
+from app.agents.watchdog.plugin_audit import (
+    LATEST_MANUAL,
+    LATEST_UNKNOWN,
+    LATEST_WPORG,
+    _fetch_wporg_version,
+    _version_lt,
+)
 from app.database.engine import AsyncSessionLocal, get_db
 from app.database.models import Alert, PluginAudit, Site
 from app.security.rate_limit import job_limiter
@@ -309,6 +315,9 @@ class ComponentResponse(BaseModel):
     name: str | None
     installed_version: str
     latest_version: str
+    # "wporg" | "manual" | "unknown" — without this the UI cannot tell
+    # "confirmed current" from "never looked up", which read identically.
+    latest_source: str
     risk_level: str
     is_active: bool | None
     source: str
@@ -324,6 +333,10 @@ class ComponentCreate(BaseModel):
     slug: str = Field(min_length=1, max_length=255)
     name: str | None = Field(default=None, max_length=255)
     installed_version: str = Field(min_length=1, max_length=50)
+    # For premium and custom components the directory has never heard of —
+    # Avada, Swift Performance, anything built in-house — the operator is the
+    # only possible authority on what the newest release is.
+    latest_version: str | None = Field(default=None, max_length=50)
     # None is meaningful: "I don't know", distinct from "installed, inactive".
     is_active: bool | None = None
 
@@ -331,6 +344,7 @@ class ComponentCreate(BaseModel):
 class ComponentUpdate(BaseModel):
     name: str | None = Field(default=None, max_length=255)
     installed_version: str | None = Field(default=None, min_length=1, max_length=50)
+    latest_version: str | None = Field(default=None, max_length=50)
     is_active: bool | None = None
 
 
@@ -355,13 +369,53 @@ def _component_row(a: PluginAudit) -> dict[str, Any]:
         "name": a.plugin_name,
         "installed_version": a.installed_version,
         "latest_version": a.latest_version,
+        "latest_source": a.latest_source,
         "risk_level": a.risk_level,
         "is_active": a.is_active,
         "source": a.source,
-        "outdated": _version_lt(a.installed_version, a.latest_version),
+        "outdated": (
+            a.latest_source != LATEST_UNKNOWN
+            and _version_lt(a.installed_version, a.latest_version)
+        ),
         "vulnerability_count": len(vulns) if isinstance(vulns, list) else 0,
         "audited_at": a.audited_at,
     }
+
+
+async def _lookup_wporg(slug: str, component_type: str) -> str | None:
+    """Latest version from the WordPress.org directory, or None if unlisted."""
+    import httpx
+
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as client:
+            return await _fetch_wporg_version(client, slug, component_type)
+    except Exception:
+        return None
+
+
+class LookupResponse(BaseModel):
+    slug: str
+    found: bool
+    latest_version: str | None
+
+
+@router.get("/components/lookup", response_model=LookupResponse)
+async def lookup_component(
+    slug: str = Query(min_length=1, max_length=255),
+    component_type: Literal["plugin", "theme"] = "plugin",
+) -> dict[str, Any]:
+    """Resolve a slug against WordPress.org before anything is saved.
+
+    Lets the form tell the operator immediately whether the directory knows
+    this component — and therefore whether they need to supply the latest
+    version themselves, as they must for Avada, Swift Performance or an
+    in-house build.
+    """
+    normalized = _normalize_slug(slug)
+    if not normalized:
+        return {"slug": slug, "found": False, "latest_version": None}
+    latest = await _lookup_wporg(normalized, component_type)
+    return {"slug": normalized, "found": latest is not None, "latest_version": latest}
 
 
 @router.get("/components", response_model=list[ComponentResponse])
@@ -407,16 +461,32 @@ async def create_component(
             detail=f"{payload.component_type} '{slug}' is already recorded for this site",
         )
 
+    installed = payload.installed_version.strip()
+
+    # Resolve the latest version NOW rather than leaving it equal to installed
+    # until the next 6-hourly audit — which showed every newly-added component
+    # as "up to date" no matter how old it was.
+    latest, latest_source = installed, LATEST_UNKNOWN
+    if payload.latest_version and payload.latest_version.strip():
+        latest, latest_source = payload.latest_version.strip(), LATEST_MANUAL
+    else:
+        found = await _lookup_wporg(slug, payload.component_type)
+        if found:
+            latest, latest_source = found, LATEST_WPORG
+
     row = PluginAudit(
         site_id=payload.site_id,
         plugin_slug=slug,
         plugin_name=payload.name or slug,
         component_type=payload.component_type,
-        installed_version=payload.installed_version.strip(),
-        # Left equal to installed until the audit runs, so nothing is reported
-        # as outdated on the strength of a value nobody has looked up yet.
-        latest_version=payload.installed_version.strip(),
-        risk_level="low",
+        installed_version=installed,
+        latest_version=latest,
+        latest_source=latest_source,
+        risk_level=(
+            "high" if latest_source != LATEST_UNKNOWN and _version_lt(installed, latest)
+            else "unknown" if latest_source == LATEST_UNKNOWN
+            else "low"
+        ),
         vulnerability_details={},
         is_active=payload.is_active,
         source="manual",
@@ -444,6 +514,22 @@ async def update_component(
         row.plugin_name = payload.name
     if payload.installed_version is not None:
         row.installed_version = payload.installed_version.strip()
+    if payload.latest_version is not None:
+        supplied = payload.latest_version.strip()
+        if supplied:
+            # Recorded as `manual` so the auditor preserves it: for a premium
+            # or custom component wp.org will never have an answer, and
+            # overwriting this with the installed version each run is exactly
+            # what made it look permanently current.
+            row.latest_version, row.latest_source = supplied, LATEST_MANUAL
+        else:
+            # Cleared — hand authority back to the directory lookup.
+            row.latest_version, row.latest_source = row.installed_version, LATEST_UNKNOWN
+    row.risk_level = (
+        "unknown" if row.latest_source == LATEST_UNKNOWN
+        else "high" if _version_lt(row.installed_version, row.latest_version)
+        else "low"
+    )
     if payload.is_active is not None:
         row.is_active = payload.is_active
     await db.flush()
