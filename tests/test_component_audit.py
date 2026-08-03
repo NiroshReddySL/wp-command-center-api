@@ -25,7 +25,12 @@ from app.agents.watchdog.plugin_audit import (
     plugin_component,
     theme_component,
 )
-from app.api.watchdog import BUCKET_PREFIXES, _bucket, _normalize_slug
+from app.api.watchdog import (
+    BUCKET_PREFIXES,
+    ComponentUpdate,
+    _bucket,
+    _normalize_slug,
+)
 
 
 class TestPluginParsing:
@@ -226,3 +231,37 @@ class TestLatestVersionResolution:
         latest, source = PluginAuditor._resolve_latest(c, None)
         assert (latest, source) == ("2.4.0", LATEST_MANUAL)
         assert _version_lt("2.3.0", latest) is True  # correctly reads as outdated
+
+
+class TestComponentUpdateSchema:
+    """Editing a hand-recorded component. The subtlety is that `None` has two
+    meanings on the wire — "leave alone" and "set to not-known" — and only
+    `model_fields_set` can tell them apart."""
+
+    def test_omitted_fields_are_distinguishable_from_explicit_nulls(self) -> None:
+        omitted = ComponentUpdate()
+        explicit = ComponentUpdate(is_active=None)
+        assert "is_active" not in omitted.model_fields_set
+        assert "is_active" in explicit.model_fields_set
+        # Both read as None, which is exactly why the check cannot be `is None`.
+        assert omitted.is_active is None and explicit.is_active is None
+
+    def test_clearing_the_latest_version_is_expressible(self) -> None:
+        # An empty string hands authority back to the directory lookup; the
+        # field being absent must leave the stored value alone.
+        cleared = ComponentUpdate(latest_version="")
+        assert "latest_version" in cleared.model_fields_set
+        assert cleared.latest_version == ""
+
+    def test_partial_edits_carry_only_what_changed(self) -> None:
+        patch = ComponentUpdate(installed_version="3.13.0")
+        assert patch.model_fields_set == {"installed_version"}
+
+    def test_versions_are_length_bounded(self) -> None:
+        import pytest
+        from pydantic import ValidationError
+
+        with pytest.raises(ValidationError):
+            ComponentUpdate(installed_version="")        # min_length=1
+        with pytest.raises(ValidationError):
+            ComponentUpdate(latest_version="x" * 51)     # column is String(50)

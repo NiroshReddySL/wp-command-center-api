@@ -510,12 +510,18 @@ async def update_component(
             status_code=409,
             detail="This component is read from WordPress and cannot be edited by hand",
         )
-    if payload.name is not None:
-        row.plugin_name = payload.name
+    # `model_fields_set` distinguishes "not supplied" from an explicit null.
+    # It matters for is_active, whose whole point is being tri-state: without
+    # it there is no way to move a component back to "not known" once someone
+    # has said active or inactive.
+    sent = payload.model_fields_set
+
+    if "name" in sent:
+        row.plugin_name = (payload.name or "").strip() or row.plugin_slug
     if payload.installed_version is not None:
         row.installed_version = payload.installed_version.strip()
-    if payload.latest_version is not None:
-        supplied = payload.latest_version.strip()
+    if "latest_version" in sent:
+        supplied = (payload.latest_version or "").strip()
         if supplied:
             # Recorded as `manual` so the auditor preserves it: for a premium
             # or custom component wp.org will never have an answer, and
@@ -524,14 +530,21 @@ async def update_component(
             row.latest_version, row.latest_source = supplied, LATEST_MANUAL
         else:
             # Cleared — hand authority back to the directory lookup.
-            row.latest_version, row.latest_source = row.installed_version, LATEST_UNKNOWN
+            row.latest_source = LATEST_UNKNOWN
+    if "is_active" in sent:
+        row.is_active = payload.is_active
+
+    # An unresolved component has no independent "latest": it must follow the
+    # installed version, or bumping installed past a stale mirrored value
+    # leaves latest reading lower than installed, which is nonsense on screen.
+    if row.latest_source == LATEST_UNKNOWN:
+        row.latest_version = row.installed_version
+
     row.risk_level = (
         "unknown" if row.latest_source == LATEST_UNKNOWN
         else "high" if _version_lt(row.installed_version, row.latest_version)
         else "low"
     )
-    if payload.is_active is not None:
-        row.is_active = payload.is_active
     await db.flush()
     return _component_row(row)
 
