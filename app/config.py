@@ -14,6 +14,15 @@ class Settings(BaseSettings):
     GSC_CLIENT_ID: str = ""
     GSC_CLIENT_SECRET: str = ""
     WPSCAN_API_KEY: str = ""
+    # How long a cached vulnerability answer stays usable. Long by design:
+    # the free plan allows 25 requests a day against an install tracking
+    # dozens of components, so re-fetching everything daily is not affordable.
+    # A week means each component refreshes roughly once per week, spread
+    # across runs, which fits comfortably inside the allowance.
+    WPSCAN_CACHE_TTL_HOURS: int = 168
+    # Requests held back from the daily allowance so a re-run triggered by
+    # hand is never starved by the scheduled sweep.
+    WPSCAN_QUOTA_RESERVE: int = 5
     # Google PageSpeed Insights API key — optional; raises the quota from
     # ~25 req/100s (per IP, keyless) to 25k/day so perf checks stop flaking.
     PSI_API_KEY: str = ""

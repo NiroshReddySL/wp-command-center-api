@@ -231,6 +231,38 @@ class PluginAudit(Base):
     site: Mapped["Site"] = relationship("Site", back_populates="plugin_audits")
 
 
+class VulnerabilityCache(Base):
+    """Cached WPScan answers, keyed by component rather than by version.
+
+    WPScan returns every known vulnerability for a slug, each with the version
+    it was `fixed_in`; deciding which ones affect a particular install is local
+    arithmetic. So one fetch per slug serves every site and every version, and
+    the cache does not have to be invalidated when a component is updated.
+
+    It exists because the free plan allows 25 requests a day against an
+    install tracking dozens of components. Without it the first run of the day
+    exhausts the quota and every component after that reports "unknown" —
+    which is exactly the "no finding means healthy" trap this module spends
+    its whole time avoiding.
+    """
+
+    __tablename__ = "vulnerability_cache"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    component_type: Mapped[str] = mapped_column(String(10), nullable=False)
+    slug: Mapped[str] = mapped_column(String(255), nullable=False)
+    # The raw vulnerability list. An empty list is a real answer — "WPScan
+    # knows this component and it has none" — and is not the same as no row.
+    vulnerabilities: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=False)
+    fetched_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    __table_args__ = (
+        UniqueConstraint("component_type", "slug", name="uq_vulnerability_cache_type_slug"),
+    )
+
+
 class TrafficSnapshot(Base):
     """Daily traffic snapshot per site, pulled from GA4 or estimated from post data.
 

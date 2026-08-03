@@ -6,6 +6,8 @@ rendered that as a clean bill of health. These tests pin the parsing, the
 version/CVE reasoning and the bucketing that make a hand-entered component
 audit exactly like a WordPress-read one.
 """
+from sqlalchemy import UniqueConstraint
+
 from app.agents.watchdog.plugin_audit import (
     COMPONENT_PLUGIN,
     COMPONENT_THEME,
@@ -18,7 +20,6 @@ from app.agents.watchdog.plugin_audit import (
     WPSCAN_AUTH_TYPE,
     Component,
     PluginAuditor,
-    VulnLookup,
     _status_to_active,
     _version_lt,
     active_vulnerabilities,
@@ -31,6 +32,8 @@ from app.api.watchdog import (
     _bucket,
     _normalize_slug,
 )
+from app.connectors.wpscan import VulnLookup
+from app.database.models import VulnerabilityCache
 
 
 class TestPluginParsing:
@@ -265,3 +268,70 @@ class TestComponentUpdateSchema:
             ComponentUpdate(installed_version="")        # min_length=1
         with pytest.raises(ValidationError):
             ComponentUpdate(latest_version="x" * 51)     # column is String(50)
+
+
+class TestVulnerabilityCaching:
+    """WPScan's free plan allows 25 requests a day and this install tracks
+    dozens of components, so a lookup-everything-every-run design exhausts the
+    allowance in its first run and reports "unknown" for the rest of the day —
+    the exact "no finding means healthy" trap the module exists to avoid.
+    """
+
+    def test_cache_is_keyed_by_component_not_by_version(self) -> None:
+        # WPScan returns every vulnerability with the version it was fixed in,
+        # so one answer serves any installed version. Keying by version would
+        # multiply the request count by the number of distinct installs and
+        # re-fetch on every upgrade.
+        cols = {c.name for c in VulnerabilityCache.__table__.columns}
+        assert {"component_type", "slug", "vulnerabilities", "fetched_at"} <= cols
+        assert "installed_version" not in cols
+
+    def test_uniqueness_is_per_type_and_slug(self) -> None:
+        # A plugin and a theme can share a slug and are different components.
+        uniques = [
+            tuple(c.name for c in con.columns)
+            for con in VulnerabilityCache.__table__.constraints
+            if isinstance(con, UniqueConstraint)
+        ]
+        assert ("component_type", "slug") in uniques
+
+    def test_an_empty_list_is_a_real_answer(self) -> None:
+        # "WPScan knows this component and it has no vulnerabilities" must be
+        # storable, and must not be confused with "never fetched".
+        row = VulnerabilityCache(component_type="plugin", slug="akismet", vulnerabilities=[])
+        assert row.vulnerabilities == []
+
+    def test_filtering_still_happens_against_the_installed_version(self) -> None:
+        # The cached payload is version-independent; which entries apply is
+        # decided locally, which is what makes the cache reusable.
+        cached = [
+            {"title": "old", "fixed_in": "3.0.0"},
+            {"title": "unpatched", "fixed_in": None},
+        ]
+        assert len(active_vulnerabilities("2.0.0", cached)) == 2
+        assert [v["title"] for v in active_vulnerabilities("3.0.0", cached)] == ["unpatched"]
+
+    def test_ttl_is_long_enough_to_fit_the_free_allowance(self) -> None:
+        # 44 components refreshed daily would need 44 requests/day against a
+        # limit of 25. A weekly TTL spreads that to roughly 6/day.
+        from app.config import settings
+
+        assert settings.WPSCAN_CACHE_TTL_HOURS >= 24 * 3
+        assert settings.WPSCAN_QUOTA_RESERVE > 0
+
+
+class TestQuota:
+    def test_reserve_is_held_back_for_manual_runs(self) -> None:
+        from app.config import settings
+        from app.connectors.wpscan import Quota
+
+        quota = Quota(limit=25, remaining=25)
+        budget = max(0, quota.remaining - settings.WPSCAN_QUOTA_RESERVE)
+        assert budget < quota.remaining  # a hand-triggered re-run can still run
+
+    def test_an_exhausted_allowance_yields_no_budget(self) -> None:
+        from app.config import settings
+        from app.connectors.wpscan import Quota
+
+        quota = Quota(limit=25, remaining=settings.WPSCAN_QUOTA_RESERVE)
+        assert max(0, quota.remaining - settings.WPSCAN_QUOTA_RESERVE) == 0

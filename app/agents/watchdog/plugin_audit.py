@@ -19,6 +19,7 @@ import asyncio
 import logging
 import re
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import httpx
@@ -28,7 +29,8 @@ from app.agents.base import BaseAgent
 from app.config import settings
 from app.connectors.retry import request_with_retries
 from app.connectors.wordpress import WordPressConnector
-from app.database.models import Alert, PluginAudit, Site
+from app.connectors.wpscan import fetch_quota, fetch_vulnerabilities
+from app.database.models import Alert, PluginAudit, Site, VulnerabilityCache
 
 logger = logging.getLogger(__name__)
 
@@ -177,46 +179,6 @@ async def _fetch_wporg_version(
     except Exception as exc:
         logger.warning("wordpress.org %s lookup failed for %s: %s", component_type, slug, exc)
     return None
-
-
-@dataclass(frozen=True)
-class VulnLookup:
-    """`vulns is None` means the lookup failed — unknown, never "clean"."""
-
-    vulns: list[dict] | None
-    auth_failed: bool = False
-
-
-async def _fetch_wpscan_vulns(
-    client: httpx.AsyncClient, slug: str, component_type: str, api_key: str
-) -> VulnLookup:
-    plural = "themes" if component_type == COMPONENT_THEME else "plugins"
-    try:
-        resp = await request_with_retries(
-            lambda: client.get(
-                f"https://wpscan.com/api/v3/{plural}/{slug}",
-                headers={"Authorization": f"Token token={api_key}"},
-                timeout=10.0,
-            ),
-            what=f"WPScan {component_type} {slug}",
-        )
-        if resp.status_code == 200:
-            data = resp.json()
-            body = data.get(slug, {}) if isinstance(data, dict) else {}
-            vulns = body.get("vulnerabilities") if isinstance(body, dict) else None
-            return VulnLookup(vulns if isinstance(vulns, list) else [])
-        if resp.status_code == 404:  # unknown to WPScan — genuinely no data
-            return VulnLookup([])
-        if resp.status_code in (401, 403):
-            logger.warning("WPScan rejected the API key (HTTP %d)", resp.status_code)
-            return VulnLookup(None, auth_failed=True)
-        logger.warning(
-            "WPScan returned HTTP %d for %s — vulnerability status unknown",
-            resp.status_code, slug,
-        )
-    except Exception as exc:
-        logger.warning("WPScan lookup failed for %s — status unknown: %s", slug, exc)
-    return VulnLookup(None)
 
 
 # ── Version comparison ───────────────────────────────────────────────────────
@@ -432,41 +394,128 @@ class PluginAuditor(BaseAgent):
     async def _enrich(
         self, components: list[Component]
     ) -> tuple[list[tuple[Component, str | None, list[dict] | None]], bool]:
-        wpscan_key = settings.WPSCAN_API_KEY
-        semaphore = asyncio.Semaphore(5)
-        auth_failed = False
+        """Resolve latest versions and vulnerabilities for every component.
 
-        async def lookup(
-            client: httpx.AsyncClient, component: Component
-        ) -> tuple[Component, str | None, list[dict] | None]:
-            nonlocal auth_failed
-            async with semaphore:
-                if wpscan_key:
-                    latest, vuln = await asyncio.gather(
-                        _fetch_wporg_version(client, component.slug, component.component_type),
-                        _fetch_wpscan_vulns(
-                            client, component.slug, component.component_type, wpscan_key
-                        ),
-                    )
-                else:
-                    latest = await _fetch_wporg_version(
-                        client, component.slug, component.component_type
-                    )
-                    vuln = VulnLookup(None)
-                if vuln.auth_failed:
-                    auth_failed = True
-                # `latest` stays None on a failed lookup. Substituting the
-                # installed version here is what made an unlisted component
-                # compare equal and report as up to date.
-                return component, latest, vuln.vulns
+        WordPress.org is unmetered, so every component is looked up there
+        every run. WPScan is not: the free plan allows 25 requests a day
+        against an install tracking dozens of components, so its answers come
+        from the cache and only a bounded number of refreshes are spent per
+        run — see `_vuln_lookups`.
+        """
+        semaphore = asyncio.Semaphore(5)
 
         async with httpx.AsyncClient(
             timeout=10.0,
             limits=httpx.Limits(max_connections=5, max_keepalive_connections=5),
         ) as client:
-            results = await asyncio.gather(*[lookup(client, c) for c in components])
 
-        return list(results), auth_failed
+            async def latest_for(component: Component) -> str | None:
+                async with semaphore:
+                    return await _fetch_wporg_version(
+                        client, component.slug, component.component_type
+                    )
+
+            latest_versions, (vulns_by_key, auth_failed) = await asyncio.gather(
+                asyncio.gather(*[latest_for(c) for c in components]),
+                self._vuln_lookups(client, components),
+            )
+
+        # `latest` stays None on a failed lookup. Substituting the installed
+        # version here is what made an unlisted component compare equal and
+        # report as up to date.
+        return (
+            [(c, latest_versions[i], vulns_by_key.get(c.key)) for i, c in enumerate(components)],
+            auth_failed,
+        )
+
+    async def _vuln_lookups(
+        self, client: httpx.AsyncClient, components: list[Component]
+    ) -> tuple[dict[tuple[str, str], list[dict] | None], bool]:
+        """Vulnerabilities per component, served from cache wherever possible.
+
+        The cache is keyed by component, not by version: WPScan returns every
+        vulnerability along with the version it was fixed in, so one answer
+        serves every site and survives upgrades.
+
+        Refreshes are bounded by what the API says is actually left today,
+        rather than by a guess. When the allowance runs out, a stale cached
+        answer is used in preference to nothing — week-old vulnerability data
+        is vastly better than reporting "unknown" — and only components that
+        have never been fetched fall back to unknown.
+        """
+        key = settings.WPSCAN_API_KEY
+        if not key:
+            return {c.key: None for c in components}, False
+
+        rows = (await self.db.execute(
+            select(VulnerabilityCache).where(
+                VulnerabilityCache.slug.in_([c.slug for c in components])
+            )
+        )).scalars().all()
+        cached = {(r.component_type, r.slug): r for r in rows}
+
+        cutoff = datetime.now(UTC) - timedelta(hours=settings.WPSCAN_CACHE_TTL_HOURS)
+        never_fetched = [c for c in components if c.key not in cached]
+        stale = [
+            c for c in components
+            if c.key in cached and cached[c.key].fetched_at < cutoff
+        ]
+        # Never-fetched first: an unknown component is a real gap, whereas a
+        # stale one still has an answer.
+        candidates = never_fetched + sorted(
+            stale, key=lambda c: cached[c.key].fetched_at
+        )
+
+        budget = 0
+        if candidates:
+            quota = await fetch_quota(client, key)
+            if quota is None:
+                # Couldn't read the allowance — refresh conservatively rather
+                # than risk burning it all in one run.
+                budget = min(len(candidates), 5)
+            else:
+                budget = max(0, quota.remaining - settings.WPSCAN_QUOTA_RESERVE)
+                logger.info(
+                    "WPScan quota: %d/%d left, %d component(s) need refreshing, "
+                    "refreshing %d this run",
+                    quota.remaining, quota.limit, len(candidates),
+                    min(budget, len(candidates)),
+                )
+
+        auth_failed = False
+        for component in candidates[:budget]:
+            result = await fetch_vulnerabilities(
+                client, component.slug, component.component_type, key
+            )
+            if result.auth_failed:
+                auth_failed = True
+                break  # every subsequent call fails identically — stop
+            if result.vulns is None:
+                continue  # transient: keep whatever the cache already holds
+            row = cached.get(component.key)
+            if row:
+                row.vulnerabilities = result.vulns
+                row.fetched_at = datetime.now(UTC)
+            else:
+                row = VulnerabilityCache(
+                    component_type=component.component_type,
+                    slug=component.slug,
+                    vulnerabilities=result.vulns,
+                )
+                self.db.add(row)
+                cached[component.key] = row
+
+        if candidates and len(candidates) > budget:
+            logger.info(
+                "WPScan: %d component(s) left for a later run (daily allowance)",
+                len(candidates) - budget,
+            )
+
+        return (
+            {c.key: (cached[c.key].vulnerabilities if c.key in cached else None)
+             for c in components},
+            auth_failed,
+        )
 
     # ── Alerts ───────────────────────────────────────────────────────────────
 
