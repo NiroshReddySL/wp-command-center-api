@@ -183,17 +183,41 @@ class PerformanceSnapshot(Base):
 
 
 class PluginAudit(Base):
+    """One auditable site component — a plugin or a theme.
+
+    The table name and the `plugin_*` columns predate theme support; they now
+    hold either kind, discriminated by `component_type`. Renaming them would
+    touch a lot of code for no behavioural gain, so the meaning is documented
+    here instead.
+    """
+
     __tablename__ = "plugin_audits"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
     site_id: Mapped[str] = mapped_column(String(36), ForeignKey("sites.id", ondelete="CASCADE"), nullable=False)
     plugin_slug: Mapped[str] = mapped_column(String(255), nullable=False)
     plugin_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # "plugin" | "theme" — a plugin and a theme can legitimately share a slug,
+    # so this is part of a component's identity, never just a label.
+    component_type: Mapped[str] = mapped_column(String(10), default="plugin", nullable=False)
     installed_version: Mapped[str] = mapped_column(String(50), nullable=False)
     latest_version: Mapped[str] = mapped_column(String(50), nullable=False)
     risk_level: Mapped[str] = mapped_column(String(20), default="low", nullable=False)
     vulnerability_details: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    # NULL means "not known" rather than "inactive". WordPress reports this;
+    # someone entering a component by hand may simply not have said.
+    is_active: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    # "wordpress" (read from the REST API) | "manual" (entered by a user
+    # because the site has no Application Password). A WordPress-sourced run
+    # reconciles only its own rows — it must never delete what a person typed.
+    source: Mapped[str] = mapped_column(String(20), default="wordpress", nullable=False)
     audited_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "site_id", "component_type", "plugin_slug", name="uq_plugin_audits_site_type_slug"
+        ),
+    )
 
     site: Mapped["Site"] = relationship("Site", back_populates="plugin_audits")
 

@@ -185,6 +185,37 @@ EXTRA_DDL: list[str] = [
             END $$;
             """,
             "DROP INDEX IF EXISTS idx_traffic_snapshots_site_date",
+            # Component audits: plugins AND themes, from WordPress or entered
+            # by hand when a site has no Application Password.
+            "ALTER TABLE plugin_audits ADD COLUMN IF NOT EXISTS component_type VARCHAR(10) NOT NULL DEFAULT 'plugin'",
+            "ALTER TABLE plugin_audits ADD COLUMN IF NOT EXISTS source VARCHAR(20) NOT NULL DEFAULT 'wordpress'",
+            "ALTER TABLE plugin_audits ADD COLUMN IF NOT EXISTS is_active BOOLEAN",
+            """
+            DELETE FROM plugin_audits
+            WHERE id IN (
+                SELECT id FROM (
+                    SELECT id,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY site_id, component_type, plugin_slug
+                               ORDER BY audited_at DESC, id DESC
+                           ) AS rn
+                    FROM plugin_audits
+                ) ranked
+                WHERE rn > 1
+            )
+            """,
+            """
+            DO $$
+            BEGIN
+                IF NOT EXISTS (
+                    SELECT 1 FROM pg_constraint WHERE conname = 'uq_plugin_audits_site_type_slug'
+                ) THEN
+                    ALTER TABLE plugin_audits
+                        ADD CONSTRAINT uq_plugin_audits_site_type_slug
+                        UNIQUE (site_id, component_type, plugin_slug);
+                END IF;
+            END $$;
+            """,
 ]
 
 

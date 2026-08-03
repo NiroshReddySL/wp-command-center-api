@@ -33,12 +33,26 @@ def upgrade() -> None:
         )
         """
     )
-    op.create_unique_constraint(
-        "uq_traffic_snapshots_site_date", "traffic_snapshots", ["site_id", "date"]
+    # Guarded, because 0001_baseline builds the schema with
+    # `Base.metadata.create_all` from the CURRENT models — which already carry
+    # this constraint. On a fresh database it therefore exists before this
+    # migration runs, and an unguarded ADD CONSTRAINT aborted the whole chain.
+    op.execute(
+        """
+        DO $$
+        BEGIN
+            IF NOT EXISTS (
+                SELECT 1 FROM pg_constraint WHERE conname = 'uq_traffic_snapshots_site_date'
+            ) THEN
+                ALTER TABLE traffic_snapshots
+                    ADD CONSTRAINT uq_traffic_snapshots_site_date UNIQUE (site_id, date);
+            END IF;
+        END $$;
+        """
     )
     # The unique constraint's own index covers the same (site_id, date)
     # lookup this plain index existed for — redundant once it exists.
-    op.drop_index("idx_traffic_snapshots_site_date", table_name="traffic_snapshots")
+    op.execute("DROP INDEX IF EXISTS idx_traffic_snapshots_site_date")
 
 
 def downgrade() -> None:

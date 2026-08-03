@@ -228,6 +228,25 @@ class WordPressConnector:
         response.raise_for_status()
         return response.json()
 
+    async def get_themes(self) -> list[dict[str, Any]]:
+        """Installed themes via /wp/v2/themes.
+
+        Authenticated like the plugin list, but with a different capability:
+        listing every theme needs `switch_themes`, whereas `?status=active`
+        only needs `edit_posts`. So an Application Password belonging to a
+        non-administrator can still see the active theme — worth falling back
+        to, since the active theme is the one actually serving requests.
+        """
+        if not self.has_auth:
+            raise PermissionError("Theme list requires an Application Password")
+        response = await self._get(f"{self.base_url}/wp-json/wp/v2/themes")
+        if response.status_code in (401, 403):
+            active = await self._get(f"{self.base_url}/wp-json/wp/v2/themes?status=active")
+            active.raise_for_status()
+            return active.json()
+        response.raise_for_status()
+        return response.json()
+
     async def update_post_meta(self, post_id: int, meta_key: str, meta_value: str) -> dict[str, Any]:
         if not self.has_auth:
             raise PermissionError("Updating post meta requires an Application Password")

@@ -1,14 +1,16 @@
 import asyncio
+import re
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
-from pydantic import BaseModel
-from sqlalchemy import func, select
+from pydantic import BaseModel, Field
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.agents.watchdog.plugin_audit import _version_lt
 from app.database.engine import AsyncSessionLocal, get_db
-from app.database.models import Alert, Site
+from app.database.models import Alert, PluginAudit, Site
 from app.security.rate_limit import job_limiter
 
 router = APIRouter()
@@ -42,6 +44,7 @@ async def list_alerts(
     agent: str | None = None,
     status: str | None = None,
     type: str | None = None,
+    bucket: str | None = None,
     limit: int = Query(200, ge=1, le=500),
     offset: int = Query(0, ge=0),
     db: AsyncSession = Depends(get_db),
@@ -66,6 +69,13 @@ async def list_alerts(
         query = query.where(Alert.status == status)
     else:
         query = query.where(Alert.status.in_(["open", "acknowledged"]))
+    if bucket and bucket in BUCKET_PREFIXES:
+        # Preferred over `type`: one bucket can span several type prefixes
+        # (plugins and themes both live under "component"), which a substring
+        # match cannot express.
+        query = query.where(
+            or_(*[Alert.type.startswith(p, autoescape=True) for p in BUCKET_PREFIXES[bucket]])
+        )
     if type:
         # autoescape: `_` and `%` are LIKE wildcards, and this value comes
         # straight from the client — `type=_` matched every alert.
@@ -100,11 +110,21 @@ class AlertSummary(BaseModel):
     matrix: dict[str, dict[str, int]]  # bucket -> severity -> count
 
 
+# Alert types grouped into the buckets the Watchdog tabs show. Declared once
+# so the summary counts and the list filter can never drift apart — they did,
+# via a substring `type` filter that could not express "plugins AND themes".
+BUCKET_PREFIXES: dict[str, tuple[str, ...]] = {
+    # Plugins, themes, and the site-level notices about auditing them.
+    "component": ("plugin", "theme", "component"),
+    "broken_link": ("broken_link",),
+    "performance": ("performance",),
+}
+
+
 def _bucket(alert_type: str) -> str:
-    if alert_type.startswith("plugin"):
-        return "plugin"
-    if alert_type in ("broken_link", "performance"):
-        return alert_type
+    for name, prefixes in BUCKET_PREFIXES.items():
+        if alert_type.startswith(prefixes):
+            return name
     return "other"
 
 
@@ -265,3 +285,173 @@ async def flush_watchdog(
     await _record_run(db, ran=0, failures=[])  # clears the previous banner
     background_tasks.add_task(_run_watchdog, req.site_id, req.module)
     return {"status": "running", "message": "Re-running watchdog in background"}
+
+
+# ── Component inventory ───────────────────────────────────────────────────────
+#
+# Reading /wp/v2/plugins and /wp/v2/themes requires an Application Password.
+# Without one a site could not be audited at all, so its components can be
+# recorded by hand here and are then checked for updates and known CVEs on
+# exactly the same path as WordPress-sourced ones.
+
+
+class ComponentResponse(BaseModel):
+    id: str
+    site_id: str
+    component_type: str
+    slug: str
+    name: str | None
+    installed_version: str
+    latest_version: str
+    risk_level: str
+    is_active: bool | None
+    source: str
+    outdated: bool
+    vulnerability_count: int
+    audited_at: datetime
+
+
+class ComponentCreate(BaseModel):
+    site_id: str
+    component_type: Literal["plugin", "theme"]
+    # The wp.org / WPScan lookup key — "akismet", not "Akismet Anti-Spam".
+    slug: str = Field(min_length=1, max_length=255)
+    name: str | None = Field(default=None, max_length=255)
+    installed_version: str = Field(min_length=1, max_length=50)
+    # None is meaningful: "I don't know", distinct from "installed, inactive".
+    is_active: bool | None = None
+
+
+class ComponentUpdate(BaseModel):
+    name: str | None = Field(default=None, max_length=255)
+    installed_version: str | None = Field(default=None, min_length=1, max_length=50)
+    is_active: bool | None = None
+
+
+def _normalize_slug(raw: str) -> str:
+    """wp.org slugs are lowercase and hyphenated. Accepting "Akismet" or a
+    stray "akismet/akismet.php" and normalising beats a lookup that silently
+    finds nothing and reports the component as up to date."""
+    slug = raw.strip().lower()
+    if "/" in slug:
+        slug = slug.split("/")[0]
+    return re.sub(r"[^a-z0-9._-]+", "-", slug).strip("-")
+
+
+def _component_row(a: PluginAudit) -> dict[str, Any]:
+    details = a.vulnerability_details or {}
+    vulns = details.get("vulnerabilities") if isinstance(details, dict) else None
+    return {
+        "id": a.id,
+        "site_id": a.site_id,
+        "component_type": a.component_type,
+        "slug": a.plugin_slug,
+        "name": a.plugin_name,
+        "installed_version": a.installed_version,
+        "latest_version": a.latest_version,
+        "risk_level": a.risk_level,
+        "is_active": a.is_active,
+        "source": a.source,
+        "outdated": _version_lt(a.installed_version, a.latest_version),
+        "vulnerability_count": len(vulns) if isinstance(vulns, list) else 0,
+        "audited_at": a.audited_at,
+    }
+
+
+@router.get("/components", response_model=list[ComponentResponse])
+async def list_components(
+    site_id: str | None = None,
+    source: str | None = None,
+    db: AsyncSession = Depends(get_db),
+) -> list[dict[str, Any]]:
+    """Every audited component — WordPress-read and hand-entered alike."""
+    query = select(PluginAudit).order_by(
+        PluginAudit.component_type, PluginAudit.plugin_slug
+    )
+    if site_id:
+        query = query.where(PluginAudit.site_id == site_id)
+    if source:
+        query = query.where(PluginAudit.source == source)
+    rows = (await db.execute(query)).scalars().all()
+    return [_component_row(a) for a in rows]
+
+
+@router.post("/components", response_model=ComponentResponse, status_code=201)
+async def create_component(
+    payload: ComponentCreate, db: AsyncSession = Depends(get_db)
+) -> dict[str, Any]:
+    site = await db.get(Site, payload.site_id)
+    if not site:
+        raise HTTPException(status_code=404, detail="Site not found")
+
+    slug = _normalize_slug(payload.slug)
+    if not slug:
+        raise HTTPException(status_code=422, detail="Slug is empty after normalisation")
+
+    existing = (await db.execute(
+        select(PluginAudit).where(
+            PluginAudit.site_id == payload.site_id,
+            PluginAudit.component_type == payload.component_type,
+            PluginAudit.plugin_slug == slug,
+        )
+    )).scalar_one_or_none()
+    if existing:
+        raise HTTPException(
+            status_code=409,
+            detail=f"{payload.component_type} '{slug}' is already recorded for this site",
+        )
+
+    row = PluginAudit(
+        site_id=payload.site_id,
+        plugin_slug=slug,
+        plugin_name=payload.name or slug,
+        component_type=payload.component_type,
+        installed_version=payload.installed_version.strip(),
+        # Left equal to installed until the audit runs, so nothing is reported
+        # as outdated on the strength of a value nobody has looked up yet.
+        latest_version=payload.installed_version.strip(),
+        risk_level="low",
+        vulnerability_details={},
+        is_active=payload.is_active,
+        source="manual",
+    )
+    db.add(row)
+    await db.flush()
+    return _component_row(row)
+
+
+@router.put("/components/{component_id}", response_model=ComponentResponse)
+async def update_component(
+    component_id: str, payload: ComponentUpdate, db: AsyncSession = Depends(get_db)
+) -> dict[str, Any]:
+    row = await db.get(PluginAudit, component_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Component not found")
+    if row.source != "manual":
+        # WordPress is the authority for what it reports; editing that here
+        # would be overwritten on the next run anyway.
+        raise HTTPException(
+            status_code=409,
+            detail="This component is read from WordPress and cannot be edited by hand",
+        )
+    if payload.name is not None:
+        row.plugin_name = payload.name
+    if payload.installed_version is not None:
+        row.installed_version = payload.installed_version.strip()
+    if payload.is_active is not None:
+        row.is_active = payload.is_active
+    await db.flush()
+    return _component_row(row)
+
+
+@router.delete("/components/{component_id}", status_code=204)
+async def delete_component(component_id: str, db: AsyncSession = Depends(get_db)) -> None:
+    row = await db.get(PluginAudit, component_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Component not found")
+    if row.source != "manual":
+        raise HTTPException(
+            status_code=409,
+            detail="This component is read from WordPress; remove it in WordPress instead",
+        )
+    await db.delete(row)
