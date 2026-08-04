@@ -1,7 +1,8 @@
 """Google OAuth2 flow — connect GA + GSC."""
+import logging
 from datetime import UTC, datetime, timedelta
 from typing import Any
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException
@@ -15,19 +16,43 @@ from app.database.engine import get_db
 from app.database.models import OAuthToken
 from app.security.auth import create_state_token, require_user, verify_state_token
 
+logger = logging.getLogger(__name__)
+
 router = APIRouter()
 
 _AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 _TOKEN_URL = "https://oauth2.googleapis.com/token"
 
 # Scopes needed: GA4 readonly + Search Console readonly
-_SCOPE_LIST = (
-    "https://www.googleapis.com/auth/analytics.readonly",
-    "https://www.googleapis.com/auth/webmasters.readonly",
-    "openid",
-    "email",
-)
+ANALYTICS_SCOPE = "https://www.googleapis.com/auth/analytics.readonly"
+SEARCH_CONSOLE_SCOPE = "https://www.googleapis.com/auth/webmasters.readonly"
+
+_SCOPE_LIST = (ANALYTICS_SCOPE, SEARCH_CONSOLE_SCOPE, "openid", "email")
 _SCOPES = " ".join(_SCOPE_LIST)
+
+# Which capability each scope unlocks. Requesting a scope is not the same as
+# being granted one: Google's consent screen lets people approve them
+# individually, and the sensitive Analytics/Search Console scopes are also
+# withheld when the Cloud project's consent screen has not been configured
+# for them. Either way the callback returns a perfectly valid token that then
+# fails every data call with ACCESS_TOKEN_SCOPE_INSUFFICIENT — so what was
+# actually granted has to be checked, not assumed.
+CAPABILITY_SCOPES: dict[str, str] = {
+    "analytics": ANALYTICS_SCOPE,
+    "search_console": SEARCH_CONSOLE_SCOPE,
+}
+
+
+def missing_scopes(granted: str | None) -> list[str]:
+    """Required scopes absent from what Google actually granted."""
+    have = set((granted or "").split())
+    return [scope for scope in CAPABILITY_SCOPES.values() if scope not in have]
+
+
+def capabilities(granted: str | None) -> dict[str, bool]:
+    """Which integrations this token can actually serve."""
+    have = set((granted or "").split())
+    return {name: scope in have for name, scope in CAPABILITY_SCOPES.items()}
 
 
 class GoogleStatus(BaseModel):
@@ -35,6 +60,12 @@ class GoogleStatus(BaseModel):
     email: str | None = None
     scopes: list[str] = []
     expires_at: datetime | None = None
+    # A token can exist and still be useless. These say what it can actually
+    # do, so the UI never shows a green tick for a connection that 403s on
+    # every request.
+    analytics: bool = False
+    search_console: bool = False
+    missing_scopes: list[str] = []
 
 
 class GoogleRefreshResult(BaseModel):
@@ -60,6 +91,9 @@ async def google_authorize() -> dict[str, str]:
         "scope": _SCOPES,
         "access_type": "offline",
         "prompt": "consent",  # Always get refresh token
+        # Keep scopes already approved, so re-connecting to add Analytics
+        # cannot silently drop Search Console (or vice versa).
+        "include_granted_scopes": "true",
         "state": create_state_token(),  # CSRF: callback must echo this back
     }
     url = f"{_AUTH_URL}?{urlencode(params)}"
@@ -129,6 +163,23 @@ async def google_callback(
         )
         db.add(token_record)
 
+    # Google returns a valid token even when the sensitive scopes were not
+    # approved. Saying "connected" at that point is how every Analytics call
+    # ends up returning ACCESS_TOKEN_SCOPE_INSUFFICIENT into a log file while
+    # the UI shows a green tick — so the outcome is reported honestly instead.
+    absent = missing_scopes(scope)
+    if absent:
+        logger.warning(
+            "Google connected WITHOUT required scope(s): %s — granted: %s. "
+            "Analytics and Search Console calls will fail with 403 until "
+            "these are approved.",
+            ", ".join(absent), scope or "(none)",
+        )
+        return RedirectResponse(
+            url=f"{settings.FRONTEND_URL}/settings?google_partial=1"
+            f"&missing={quote(' '.join(absent))}"
+        )
+
     return RedirectResponse(url=f"{settings.FRONTEND_URL}/settings?google_connected=1")
 
 
@@ -143,6 +194,8 @@ async def google_status(db: AsyncSession = Depends(get_db)) -> dict[str, Any]:
         "connected": True,
         "scopes": token.scope.split() if token.scope else [],
         "expires_at": token.token_expiry,
+        **capabilities(token.scope),
+        "missing_scopes": missing_scopes(token.scope),
     }
 
 

@@ -2,6 +2,13 @@
 import pytest
 from fastapi import HTTPException
 
+from app.api.auth import (
+    _SCOPES,
+    ANALYTICS_SCOPE,
+    SEARCH_CONSOLE_SCOPE,
+    capabilities,
+    missing_scopes,
+)
 from app.security.auth import (
     _decode_token,
     create_access_token,
@@ -81,3 +88,43 @@ class TestUrlGuard:
         with pytest.raises(HTTPException) as exc:
             await ensure_public_url("http://127.0.0.1:8000")
         assert exc.value.status_code == 422
+
+
+class TestGoogleScopeVerification:
+    """Google returns a perfectly valid token even when the sensitive scopes
+    were declined — its consent screen lets them be approved individually,
+    and a Cloud project that hasn't configured them gets the same result.
+    Storing that and reporting "connected" is how every Analytics call ends
+    up returning ACCESS_TOKEN_SCOPE_INSUFFICIENT into a log file behind a
+    green tick.
+    """
+
+    FULL = (
+        "https://www.googleapis.com/auth/analytics.readonly "
+        "https://www.googleapis.com/auth/webmasters.readonly openid email"
+    )
+
+    def test_a_full_grant_has_nothing_missing(self) -> None:
+        assert missing_scopes(self.FULL) == []
+        assert capabilities(self.FULL) == {"analytics": True, "search_console": True}
+
+    def test_an_identity_only_grant_is_detected(self) -> None:
+        # Exactly what was observed live: sign-in worked, every data call 403'd.
+        granted = "https://www.googleapis.com/auth/userinfo.email openid"
+        assert capabilities(granted) == {"analytics": False, "search_console": False}
+        assert len(missing_scopes(granted)) == 2
+
+    def test_a_partial_grant_names_only_what_is_absent(self) -> None:
+        granted = "https://www.googleapis.com/auth/analytics.readonly openid"
+        assert capabilities(granted) == {"analytics": True, "search_console": False}
+        assert missing_scopes(granted) == [SEARCH_CONSOLE_SCOPE]
+
+    def test_no_scope_string_is_not_treated_as_full_access(self) -> None:
+        for empty in (None, ""):
+            assert capabilities(empty) == {"analytics": False, "search_console": False}
+            assert len(missing_scopes(empty)) == 2
+
+    def test_required_scopes_are_actually_requested(self) -> None:
+        # The check is worthless if the authorize URL never asks for them.
+        assert ANALYTICS_SCOPE in _SCOPES
+        assert SEARCH_CONSOLE_SCOPE in _SCOPES
