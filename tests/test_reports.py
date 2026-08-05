@@ -11,6 +11,7 @@ from datetime import UTC, datetime
 
 import pytest
 
+from app.reports.context import ReportContext
 from app.reports.html import render_report
 from app.reports.models import Finding, Metric, Report, Section, SourceStatus, Table
 
@@ -149,3 +150,51 @@ class TestHtmlExport:
         # A brand-new site has nothing to say yet; that must not be an error.
         out = render_report(_report().to_dict())
         assert "No findings" in out
+
+
+class TestSearchArithmetic:
+    """The two ways a search report misleads without lying.
+
+    A mean of daily CTRs weights a quiet Sunday the same as a busy Tuesday,
+    so it reads differently from the same data. And an average position that
+    ignores impressions describes a site nobody visited.
+    """
+
+    @staticmethod
+    def _ctx(daily):
+        ctx = ReportContext(db=None, site=None, sources=[])  # type: ignore[arg-type]
+        ctx.search_daily = daily
+        return ctx
+
+    def test_ctr_comes_from_period_totals_not_a_mean_of_days(self) -> None:
+        # One huge day at a poor rate, one tiny day at a great rate.
+        daily = [
+            {"clicks": 10, "impressions": 10_000, "position": 20.0},
+            {"clicks": 5, "impressions": 10, "position": 2.0},
+        ]
+        totals = self._ctx(daily).search_totals
+        assert totals is not None
+        # Totals: 15 / 10,010 = 0.15%. A mean of daily rates would be 25.05%.
+        assert round(totals["ctr"], 2) == 0.15
+        assert totals["clicks"] == 15
+        assert totals["impressions"] == 10_010
+
+    def test_position_is_weighted_by_impressions(self) -> None:
+        daily = [
+            {"clicks": 0, "impressions": 10_000, "position": 20.0},
+            {"clicks": 0, "impressions": 10, "position": 2.0},
+        ]
+        totals = self._ctx(daily).search_totals
+        assert totals is not None
+        # An unweighted mean would be 11.0 — a position the site never held.
+        assert 19.9 < totals["position"] < 20.0
+
+    def test_no_data_is_none_rather_than_zeroes(self) -> None:
+        # Zero impressions and "we could not ask" must stay distinguishable.
+        assert self._ctx([]).search_totals is None
+        assert self._ctx(None).search_totals is None
+
+    def test_a_period_with_no_impressions_does_not_divide_by_zero(self) -> None:
+        totals = self._ctx([{"clicks": 0, "impressions": 0, "position": 0.0}]).search_totals
+        assert totals is not None
+        assert totals["ctr"] == 0.0 and totals["position"] == 0.0

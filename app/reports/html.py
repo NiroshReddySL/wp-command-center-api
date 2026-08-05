@@ -24,14 +24,21 @@ _CSS = """
 *{box-sizing:border-box}
 body{margin:0;background:#EDF1F5;color:#2E2E2E;line-height:1.55;
  font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Inter,Arial,sans-serif}
-.page{max-width:1080px;margin:auto;background:#fff;box-shadow:0 0 48px #14203a1a}
+.page{max-width:1320px;margin:auto;background:#fff;box-shadow:0 0 48px #14203a1a}
+.layout{display:grid;grid-template-columns:250px 1fr}
+nav{position:sticky;top:0;align-self:start;max-height:100vh;overflow:auto;padding:28px 18px;
+ background:#FAFBFE;border-right:1px solid #E2E8F0}
+nav h3{font-size:.66rem;text-transform:uppercase;letter-spacing:.15em;color:#707070;margin:0 0 10px}
+nav a{display:block;padding:5px 8px;border-radius:6px;text-decoration:none;color:#3c4658;font-size:.76rem}
+nav a:hover{background:#E1ECFF;color:#0129AC}
+.lead{font-size:1.02rem;color:#3c4658;max-width:760px;margin:.2em 0 1em}
 .cover{padding:64px 56px;color:#fff;background:linear-gradient(140deg,#0129AC,#001a6e 70%,#00113f)}
 .eyebrow{text-transform:uppercase;letter-spacing:.16em;font-weight:800;font-size:.7rem;color:#809EFC}
 h1{font-size:2.6rem;line-height:1.05;letter-spacing:-.03em;margin:.3em 0 .25em}
 .dek{font-size:1.05rem;color:#dce4ff;max-width:640px;margin:0}
 .cover-meta{display:flex;flex-wrap:wrap;gap:28px;margin-top:40px;font-size:.82rem;color:#bfc9ea}
 .cover-meta b{display:block;color:#fff;font-size:.98rem;font-weight:600}
-main{padding:44px 56px 72px}
+main{padding:40px 48px 72px;min-width:0}
 section{padding:26px 0 40px;border-bottom:1px solid #E2E8F0}
 section:last-child{border-bottom:0}
 .sec-no{font-size:.7rem;text-transform:uppercase;letter-spacing:.15em;color:#0129AC;font-weight:800}
@@ -69,10 +76,21 @@ td:nth-child(n+2){white-space:nowrap}
 .src b{font-weight:600}.src span{color:#707070}
 .foot{font-size:.75rem;color:#707070;margin-top:8px}
 @media print{
+ @page{margin:14mm}
  body{background:#fff}.page{box-shadow:none;max-width:none}
- main{padding:20px 26px}section{break-inside:avoid}.finding{break-inside:avoid}
+ .layout{display:block}nav{display:none}
+ main{padding:0}
  .cover{break-after:page}
+ /* Each section starts its own page, as in a printed deliverable. */
+ section{break-before:page;break-inside:auto;border:0;padding-top:6px}
+ section:first-child{break-before:avoid}
+ .finding,.twrap,table{break-inside:avoid}
+ thead{display:table-header-group}
+ tr{break-inside:avoid}
+ h2,h3{break-after:avoid}
+ a{color:inherit;text-decoration:none}
 }
+@media(max-width:1000px){.layout{display:block}nav{display:none}}
 @media(max-width:820px){
  .cards{grid-template-columns:repeat(2,1fr)}.fgrid{grid-template-columns:1fr}
  .cover,main{padding-left:24px;padding-right:24px}
@@ -144,19 +162,32 @@ def _finding(f: dict) -> str:
 
 
 def _section(s: dict) -> str:
+    anchor = _e(s.get("key") or "")
     head = (
         f'<div class="sec-no">{_e(s.get("number"))} / {_e(s.get("title"))}</div>'
         f'<h2>{_e(s.get("headline") or s.get("title"))}</h2>'
     )
     if s.get("unavailable"):
         return (
-            f'<section>{head}<div class="note gap"><b>Not available.</b> '
+            f'<section id="{anchor}">{head}<div class="note gap"><b>Not available.</b> '
             f'{_e(s["unavailable"])}</div></section>'
         )
     notes = "".join(f'<div class="note">{_e(n)}</div>' for n in s.get("notes", []))
     findings = "".join(_finding(f) for f in s.get("findings", []))
     tables = "".join(_table(t) for t in s.get("tables", []))
-    return f"<section>{head}{_cards(s.get('metrics', []))}{notes}{findings}{tables}</section>"
+    return (f'<section id="{anchor}">{head}{_cards(s.get("metrics", []))}'
+            f"{notes}{findings}{tables}</section>")
+
+
+def _contents(sections: list[dict]) -> str:
+    links = "".join(
+        f'<a href="#{_e(s.get("key"))}">{_e(s.get("number"))} {_e(s.get("title"))}</a>'
+        for s in sections
+    )
+    return (
+        f'<nav><h3>Contents</h3>{links}'
+        f'<a href="#coverage">Appendix · Data coverage</a></nav>'
+    )
 
 
 def _sources(sources: list[dict]) -> str:
@@ -167,7 +198,7 @@ def _sources(sources: list[dict]) -> str:
         for s in sources
     )
     return (
-        '<section><div class="sec-no">Appendix / Data coverage</div>'
+        '<section id="coverage"><div class="sec-no">Appendix / Data coverage</div>'
         "<h2>What this report could and could not measure</h2>"
         "<p>Every figure above is computed from the sources below. Nothing is estimated, "
         "inferred or generated: where a source was unavailable the section says so rather "
@@ -204,7 +235,8 @@ counted. Where something could not be measured, it says so instead of reporting 
 <div><b>{_e(summary)}</b>Findings</div>
 <div><b>{_e(data.get("site_url"))}</b>Site</div>
 </div></header>
-<main>{sections}{_sources(data.get("sources", []))}</main>
+<div class="layout">{_contents(data.get("sections", []))}
+<main>{sections}{_sources(data.get("sources", []))}</main></div>
 </div></body></html>"""
 
 

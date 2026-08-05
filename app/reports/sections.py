@@ -50,7 +50,7 @@ async def build_security(
     )).scalars().all()
 
     section = Section(
-        key="security", number="01", title="Security & Components",
+        key="security", number="07", title="Security & Components",
         headline="No plugins or themes are tracked for this site.",
     )
     if not rows:
@@ -203,7 +203,7 @@ async def build_health(
     broken = by_type.get("broken_link", 0)
 
     section = Section(
-        key="health", number="02", title="Site Health & Technical Debt",
+        key="health", number="08", title="Site Health & Technical Debt",
         headline=(
             f"{len(alerts)} findings are open or acknowledged across all monitoring agents."
             if alerts else "No open findings across any monitoring agent."
@@ -303,7 +303,7 @@ async def build_content(
 ) -> Section:
     source = _source(sources, "content")
     section = Section(
-        key="content", number="03", title="Content Portfolio",
+        key="content", number="05", title="Content Portfolio",
         headline="No content has been synced for this site.",
     )
     if source and not source.available:
@@ -393,13 +393,13 @@ async def build_content(
     return section
 
 
-# ── 04 Traffic & search ──────────────────────────────────────────────────────
+# ── 02 Traffic trend ──────────────────────────────────────────────────────
 
 async def build_traffic(
     db: AsyncSession, site_id: str, sources: list[SourceStatus]
 ) -> Section:
     section = Section(
-        key="traffic", number="04", title="Traffic & Search",
+        key="traffic", number="02", title="Traffic Trend",
         headline="No traffic data is available for this period.",
     )
     traffic_source = _source(sources, "traffic")

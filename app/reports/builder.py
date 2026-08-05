@@ -15,8 +15,16 @@ from datetime import UTC, datetime, timedelta
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.models import ReviewItem, Site
-from app.reports.models import Report
+from app.reports.context import build_context
+from app.reports.models import Report, Section
 from app.reports.sections import BUILDERS
+from app.reports.sections_exec import build_backlog, build_executive, build_roadmap
+from app.reports.sections_search import (
+    build_conversion,
+    build_markets,
+    build_metadata,
+    build_search,
+)
 from app.reports.sources import probe_all
 
 logger = logging.getLogger(__name__)
@@ -39,23 +47,33 @@ async def build_report(db: AsyncSession, site: Site) -> Report:
         sources=sources,
     )
 
-    for build in BUILDERS:
+    ctx = await build_context(db, site, sources)
+
+    async def run(name: str, coro) -> None:
         try:
-            report.sections.append(await build(db, site.id, sources))
+            report.sections.append(await coro)
         except Exception as exc:
             # One section failing must not cost the whole report — but it also
             # must not silently vanish, which would read as "nothing to report".
-            logger.exception("Report section %s failed for %s", build.__name__, site.id)
-            from app.reports.models import Section
-
+            logger.exception("Report section %s failed for %s", name, site.id)
             report.sections.append(Section(
-                key=build.__name__.removeprefix("build_"),
-                number="—",
-                title=build.__name__.removeprefix("build_").replace("_", " ").title(),
-                headline="",
+                key=name, number="—", title=name.replace("_", " ").title(), headline="",
                 unavailable=f"This section could not be produced: {exc}",
             ))
 
+    for build in BUILDERS:
+        await run(build.__name__.removeprefix("build_"), build(db, site.id, sources))
+    for build in (build_search, build_conversion, build_metadata, build_markets):
+        await run(build.__name__.removeprefix("build_"), build(ctx))
+
+    # Ordered by the section number each builder declares, so the document
+    # reads in a deliberate sequence rather than in construction order.
+    report.sections.sort(key=lambda s: s.number)
+
+    # Built last: these read the findings above and may restate but never add.
+    report.sections.insert(0, build_executive(report))
+    report.sections.append(build_roadmap(report))
+    report.sections.append(build_backlog(report))
     return report
 
 
