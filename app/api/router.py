@@ -11,6 +11,7 @@ from app.api import (
     flows,
     notifications,
     optimizer,
+    reports,
     review,
     search,
     sites,
@@ -40,6 +41,7 @@ router.include_router(watchdog.router, prefix="/watchdog", tags=["watchdog"], de
 router.include_router(optimizer.router, prefix="/optimizer", tags=["optimizer"], dependencies=protected)
 router.include_router(autopilot.router, prefix="/autopilot", tags=["autopilot"], dependencies=protected)
 router.include_router(review.router, prefix="/review", tags=["review"], dependencies=protected)
+router.include_router(reports.router, prefix="/reports", tags=["reports"], dependencies=protected)
 router.include_router(agents.router, prefix="/agents", tags=["agents"], dependencies=protected)
 router.include_router(notifications.router, prefix="/notifications", tags=["notifications"], dependencies=protected)
 router.include_router(search.router, prefix="/search", tags=["search"], dependencies=protected)
