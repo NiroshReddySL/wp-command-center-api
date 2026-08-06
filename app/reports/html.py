@@ -25,7 +25,10 @@ _CSS = """
 body{margin:0;background:#EDF1F5;color:#2E2E2E;line-height:1.55;
  font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Inter,Arial,sans-serif}
 .page{max-width:1320px;margin:auto;background:#fff;box-shadow:0 0 48px #14203a1a}
-.layout{display:grid;grid-template-columns:250px 1fr}
+/* minmax(0,1fr), not 1fr: a grid item's min-width defaults to auto, so
+   any wide table sets the track's floor and the whole document scrolls
+   sideways instead of the table scrolling inside its own box. */
+.layout{display:grid;grid-template-columns:250px minmax(0,1fr)}
 nav{position:sticky;top:0;align-self:start;max-height:100vh;overflow:auto;padding:28px 18px;
  background:#FAFBFE;border-right:1px solid #E2E8F0}
 nav h3{font-size:.66rem;text-transform:uppercase;letter-spacing:.15em;color:#707070;margin:0 0 10px}
@@ -66,6 +69,7 @@ th{background:#FAFBFE;text-align:left;text-transform:uppercase;letter-spacing:.0
  font-size:.65rem;color:#707070;font-weight:700}
 th,td{padding:8px 10px;border-bottom:1px solid #EEF2F6;vertical-align:top}
 td:nth-child(n+2){white-space:nowrap}
+td:first-child{max-width:26rem;overflow-wrap:anywhere}
 .twrap{overflow:auto;border:1px solid #E2E8F0;border-radius:10px;margin:14px 0 20px}
 .note{padding:12px 16px;border-left:3px solid #809EFC;background:#F4F7FF;
  border-radius:0 8px 8px 0;margin:10px 0;font-size:.82rem;color:#3c4658}
