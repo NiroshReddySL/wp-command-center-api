@@ -6,13 +6,21 @@ from typing import Any
 from urllib.parse import urlparse
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import ColumnElement, Float, delete, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.engine import get_db
 from app.database.models import Alert, ContentPost, PerformanceSnapshot, Site
 from app.security.rate_limit import ai_limiter, job_limiter, rescan_limiter
+from app.services.content_rescan import (
+    MAX_BATCH,
+    PostGone,
+    read_progress,
+    rescan_post,
+    run_bulk_rescan,
+)
+from app.utils.background import spawn
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -1064,118 +1072,73 @@ async def rescan_content_post(
     db: AsyncSession = Depends(get_db),
 ) -> dict[str, Any]:
     """Re-fetch from WordPress and re-run deep analysis for a single post."""
-    result = await db.execute(
+    row = (await db.execute(
         select(ContentPost, Site)
         .join(Site, ContentPost.site_id == Site.id)
         .where(ContentPost.id == post_id)
-    )
-    row = result.first()
+    )).first()
     if not row:
         raise HTTPException(status_code=404, detail="Post not found")
     post, site = row
 
-    if not post.wp_post_id:
-        raise HTTPException(status_code=422, detail="Post has no WordPress ID — cannot rescan")
-
-    import re as _re
-
-    from app.agents.optimizer.content_scorer import (
-        _analyze,
-        _fetch_page_signals,
-        _generate_ai_recommendation,
-    )
-    from app.connectors.wordpress import WordPressConnector
-
-    wp = WordPressConnector(site.url, site.api_key)
     try:
-        wp_post = await wp.get_post(post.wp_post_id, content_type=post.content_type)
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"WordPress connection failed: {exc}") from exc
-    finally:
-        await wp.close()
-
-    if not wp_post:
-        # A definitive 404 from WordPress proves this post/page no longer
-        # exists there (deleted or unpublished). Incremental sync alone
-        # can't detect a removal — it only sees "what changed" — so without
-        # this, the stale row would sit here failing every future rescan
-        # too, for up to a week until the next full reconciliation catches
-        # it (see content_sync.py). A rescan hitting a real 404 is itself
-        # proof enough to clean it up immediately.
-        stale_title = post.title
-        alerts_r = await db.execute(
-            select(Alert).where(
-                Alert.site_id == post.site_id, Alert.agent == "optimizer", Alert.type == "content_health",
-            )
-        )
-        for alert in alerts_r.scalars().all():
-            if (alert.metadata_ or {}).get("post_id") == post.id:
-                await db.delete(alert)
-        await db.delete(post)
-        await db.commit()
+        result = await rescan_post(db, post, site)
+    except PostGone as gone:
+        await db.commit()  # the removal must persist even though this 404s
         raise HTTPException(
             status_code=404,
-            detail=f'"{stale_title}" no longer exists on WordPress — removed from tracking.',
-        )
-
-    post_url = wp_post.get("link") or post.url
-    # One live-page fetch yields schema types AND the rendered H1 count
-    # (the H1 usually lives in the theme template, outside content.rendered)
-    page_signals = await _fetch_page_signals(post_url)
-
-    try:
-        health_score, issues, breakdown, word_count, reading_time = _analyze(
-            wp_post, site.url,
-            extra_schema_types=page_signals["schema_types"],
-            live_h1_count=page_signals["h1_count"],
-        )
+            detail=f'"{gone.title}" no longer exists on WordPress — removed from tracking.',
+        ) from None
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Analysis failed: {exc}") from exc
 
-    post.health_score = health_score
-    post.issues = issues
-    post.word_count = word_count
-    post.reading_time_minutes = reading_time
-    post.score_breakdown = breakdown
-    post.last_analyzed_at = datetime.now(UTC)
-
-    import hashlib
-    import html as _html_lib
-    title_raw = wp_post.get("title", {})
-    title_str = title_raw.get("rendered", "") if isinstance(title_raw, dict) else str(title_raw)
-    title_str = _html_lib.unescape(_re.sub(r"<[^>]+>", "", title_str)).strip()
-    try:
-        ai_rec = await asyncio.wait_for(
-            _generate_ai_recommendation(
-                title_str, health_score, word_count, issues, breakdown,
-                site_context=site.site_context or None,
-            ),
-            timeout=30,
-        )
-    except Exception:
-        ai_rec = None
-    # None = generation failed — keep any existing text. "" = genuinely
-    # clean — clear the stale recommendation instead of leaving old advice
-    # (e.g. a since-fixed "add FAQPage schema") displayed forever.
-    if ai_rec is not None:
-        post.ai_recommendation = ai_rec or None
-        content_text_raw = wp_post.get("content", {})
-        content_text = content_text_raw.get("rendered", "") if isinstance(content_text_raw, dict) else ""
-        post.ai_rec_hash = hashlib.sha256(
-            f"{title_str}|{health_score}|{content_text}".encode()
-        ).hexdigest()
-
     await db.commit()
-    return {
-        "id": post.id,
-        "health_score": post.health_score,
-        "word_count": post.word_count,
-        "reading_time_minutes": post.reading_time_minutes,
-        "issues": post.issues,
-        "score_breakdown": post.score_breakdown,
-        "ai_recommendation": post.ai_recommendation,
-        "last_analyzed_at": post.last_analyzed_at,
-    }
+    return result
+
+
+class BulkRescanRequest(BaseModel):
+    post_ids: list[str] = Field(min_length=1, max_length=MAX_BATCH)
+
+
+@router.post("/content-health/rescan-bulk", dependencies=[Depends(job_limiter)])
+async def rescan_content_posts(
+    payload: BulkRescanRequest, db: AsyncSession = Depends(get_db)
+) -> dict[str, Any]:
+    """Rescan a selection server-side.
+
+    One request instead of N. Firing the single-post endpoint per row means N
+    WordPress fetches, N live-page fetches and N AI calls launched at whatever
+    rate the browser manages — which is exactly what the per-post rate limit
+    exists to prevent. Here the concurrency is bounded once, deliberately.
+    """
+    current = await read_progress()
+    if current.get("running"):
+        raise HTTPException(
+            status_code=409,
+            detail="A bulk rescan is already running. Wait for it to finish.",
+        )
+
+    known = set((await db.execute(
+        select(ContentPost.id).where(ContentPost.id.in_(payload.post_ids))
+    )).scalars().all())
+    missing = [pid for pid in payload.post_ids if pid not in known]
+    queued = [pid for pid in payload.post_ids if pid in known]
+    if not queued:
+        raise HTTPException(status_code=404, detail="None of those pages exist")
+
+    spawn(run_bulk_rescan(queued), name=f"bulk-rescan-{len(queued)}")
+    return {"queued": len(queued), "skipped": len(missing)}
+
+
+@router.get("/content-health/rescan-bulk/status")
+async def bulk_rescan_status() -> dict[str, Any]:
+    """Progress of the current or most recent bulk rescan."""
+    return await read_progress()
+
 
 
 class PageInsight(BaseModel):

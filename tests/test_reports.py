@@ -14,6 +14,7 @@ import pytest
 from app.reports.context import ReportContext
 from app.reports.html import render_report
 from app.reports.models import Finding, Metric, Report, Section, SourceStatus, Table
+from app.services.content_rescan import CONCURRENCY, MAX_BATCH, BulkProgress
 
 
 def _report(**over) -> Report:
@@ -198,3 +199,35 @@ class TestSearchArithmetic:
         totals = self._ctx([{"clicks": 0, "impressions": 0, "position": 0.0}]).search_totals
         assert totals is not None
         assert totals["ctr"] == 0.0 and totals["position"] == 0.0
+
+
+class TestBulkRescanProgress:
+    """A batch of fifty takes minutes — each page costs a WordPress fetch, a
+    live page fetch and an AI call. Progress therefore has to be observable
+    while it runs, and a page that vanished has to stay distinguishable from
+    one that failed."""
+
+    def test_starts_empty_and_not_running(self) -> None:
+        p = BulkProgress()
+        assert p.running is False and p.total == 0 and p.failures == []
+
+    def test_outcomes_are_counted_separately(self) -> None:
+        # "removed" is a successful outcome — WordPress confirmed the page is
+        # gone — and must not inflate the failure count.
+        p = BulkProgress(total=3, done=1, failed=1, removed=1)
+        assert p.done + p.failed + p.removed == p.total
+        assert p.failed == 1
+
+    def test_serialises_for_the_status_endpoint(self) -> None:
+        data = BulkProgress(total=2, done=2, running=False).as_dict()
+        assert json.dumps(data)
+        assert data["total"] == 2 and data["running"] is False
+
+    def test_batch_size_is_bounded(self) -> None:
+        # Unbounded, one click could queue every page on the site against
+        # someone's production WordPress.
+        assert 0 < MAX_BATCH <= 500
+
+    def test_concurrency_is_deliberately_low(self) -> None:
+        # Every unit is another simultaneous request to the customer's site.
+        assert 1 <= CONCURRENCY <= 5
