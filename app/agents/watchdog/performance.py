@@ -8,7 +8,9 @@ every 2-hour run.
 import asyncio
 import logging
 import time
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 import httpx
 from sqlalchemy import delete, func, select
@@ -149,6 +151,131 @@ def _score_grade(score: int) -> str:
     return "Poor"
 
 
+@dataclass(frozen=True)
+class Measurement:
+    """What one page measured, or why there is no measurement.
+
+    `source` says how the number was arrived at — a PSI score and a TTFB
+    estimate are not the same claim, and collapsing them was what let a
+    throttled run look like a measured one.
+    """
+
+    url: str
+    score: int = 0
+    lcp: float = 0.0
+    cls: float = 0.0
+    fid: float = 0.0
+    ttfb: float = 0.0
+    source: str = "psi"          # "psi" | "ttfb" | "error"
+    error: str | None = None
+
+
+@dataclass(frozen=True)
+class Verdict:
+    """What a measurement means. `severity is None` means healthy — clear any
+    alert this page had rather than leaving a fixed problem on screen."""
+
+    severity: str | None
+    title: str
+    description: str
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+async def measure_page(client: httpx.AsyncClient, url: str) -> Measurement:
+    """Measure one page — PageSpeed if it answers, raw TTFB if it doesn't."""
+    psi = await _fetch_psi(client, url)
+    if psi:
+        return Measurement(
+            url=url, score=psi["score"], lcp=psi["lcp"], cls=psi["cls"],
+            fid=psi["fid"], ttfb=psi["ttfb"], source="psi",
+        )
+
+    # PSI failed (rate limit / network) — fall back to raw TTFB.
+    try:
+        ttfb = await _measure_ttfb_fallback(url)
+    except Exception as exc:
+        return Measurement(url=url, source="error", error=str(exc))
+
+    # A TTFB-only estimate does NOT get fabricated LCP/CLS: the zeros render
+    # as "—" instead of polluting Core Web Vitals trends with invented data.
+    return Measurement(url=url, score=_score_from_ttfb(ttfb), ttfb=ttfb, source="ttfb")
+
+
+def classify(m: Measurement) -> Verdict:
+    """Turn a measurement into the alert it justifies.
+
+    Shared by the scheduled sweep and the manual re-measure. Two copies of
+    these thresholds and this wording would drift, and then the same page
+    would read differently depending on which one last touched it.
+    """
+    if m.error is not None:
+        return Verdict(
+            "critical",
+            f"Page unreachable — {m.url}",
+            f"Could not connect: {m.error}",
+            {"page_url": m.url, "speed_score": 0, "strategy": "desktop"},
+        )
+
+    grade = _score_grade(m.score)
+    metadata = {
+        "page_url": m.url,
+        "speed_score": m.score,
+        "lcp_ms": round(m.lcp),
+        "cls": round(m.cls, 3),
+        "fid_ms": round(m.fid),
+        "ttfb_ms": round(m.ttfb),
+        "grade": grade,
+        "strategy": "desktop",
+        "source": m.source,
+    }
+
+    if m.source == "psi":
+        description = (
+            f"PSI desktop score: {m.score}/100 ({grade}). "
+            f"LCP: {m.lcp/1000:.1f}s, CLS: {m.cls:.2f}, TTFB: {m.ttfb:.0f}ms."
+        )
+    else:
+        description = (
+            f"Estimated score: {m.score}/100 ({grade}) from TTFB {m.ttfb:.0f}ms "
+            "— PageSpeed Insights was unavailable for this run."
+        )
+
+    if m.score < 50:
+        return Verdict("critical", f"Poor desktop performance — {m.url}", description, metadata)
+    if m.score < 90:
+        return Verdict(
+            "warning", f"Desktop performance needs improvement — {m.url}", description, metadata
+        )
+    return Verdict(None, f"Desktop performance is good — {m.url}", description, metadata)
+
+
+def snapshot_for(site_id: str, m: Measurement) -> PerformanceSnapshot:
+    """The stored history row for a measurement. Unreachable pages get none —
+    there is no number to record, and a zero would read as "measured 0"."""
+    return PerformanceSnapshot(
+        site_id=site_id,
+        page_url=m.url,
+        lcp=m.lcp,
+        cls=m.cls,
+        fid=m.fid,
+        ttfb=m.ttfb,
+        speed_score=m.score,
+        strategy="desktop",
+    )
+
+
+def psi_concurrency() -> int:
+    """Simultaneous PageSpeed calls this deployment can afford.
+
+    Keyless PSI allows ~25 requests/100s per IP, so more parallelism just
+    earns 429s and a run of TTFB estimates instead of scores.
+    """
+    return (
+        settings.PSI_CONCURRENCY_WITH_KEY if settings.PSI_API_KEY
+        else settings.PSI_CONCURRENCY
+    )
+
+
 def plan_batch(
     home_url: str,
     candidates: list[str],
@@ -256,27 +383,12 @@ class PerformanceMonitor(BaseAgent):
         # URLs actually verified this run. Only these may be reconciled — see
         # the note where stale alerts are resolved.
         measured: set[str] = set()
-        # Keyless PSI allows ~25 requests/100s per IP, so more parallelism
-        # just earns 429s and a run of TTFB estimates instead of scores.
-        semaphore = asyncio.Semaphore(
-            settings.PSI_CONCURRENCY_WITH_KEY if settings.PSI_API_KEY
-            else settings.PSI_CONCURRENCY
-        )
+        semaphore = asyncio.Semaphore(psi_concurrency())
 
         # ── Phase 1: measurements — concurrent, one pooled client ────────────
-        async def measure_url(client: httpx.AsyncClient, url: str) -> dict:
+        async def measure_url(client: httpx.AsyncClient, url: str) -> Measurement:
             async with semaphore:
-                psi = await _fetch_psi(client, url)
-
-                if psi:
-                    return {"url": url, "psi": psi, "error": None}
-
-                # PSI failed (rate limit / network) — fall back to raw TTFB
-                try:
-                    ttfb = await _measure_ttfb_fallback(url)
-                except Exception as exc:
-                    return {"url": url, "psi": None, "error": str(exc)}
-                return {"url": url, "psi": None, "ttfb": ttfb, "error": None}
+                return await measure_page(client, url)
 
         async with httpx.AsyncClient(
             limits=httpx.Limits(max_connections=4, max_keepalive_connections=2),
@@ -310,92 +422,34 @@ class PerformanceMonitor(BaseAgent):
 
 
         # ── Phase 2: DB writes — sequential (AsyncSession is not concurrency-safe)
-        async def upsert_alert(url: str, severity: str, title: str, description: str, meta: dict) -> None:
-            current = existing_by_url.pop(url, None)
+        for m in measurements:
+            measured.add(m.url)
+            verdict = classify(m)
+
+            if m.error is None:
+                self.db.add(snapshot_for(site_id, m))
+
+            if verdict.severity is None:
+                # Healthy again — clear any previous alert for this page
+                current = existing_by_url.pop(m.url, None)
+                if current:
+                    stale_ids.append(current.id)
+                continue
+
+            current = existing_by_url.pop(m.url, None)
             if current:
                 # Dismissed/acknowledged status and created_at survive, but a
                 # climb into "critical" still notifies.
                 await self.update_alert(
-                    current, severity=severity, title=title,
-                    description=description, metadata=meta,
+                    current, severity=verdict.severity, title=verdict.title,
+                    description=verdict.description, metadata=verdict.metadata,
                 )
             else:
                 alerts.append(await self.create_alert(
-                    site_id=site_id, agent="watchdog", severity=severity,
-                    type_="performance", title=title, description=description, metadata=meta,
+                    site_id=site_id, agent="watchdog", severity=verdict.severity,
+                    type_="performance", title=verdict.title,
+                    description=verdict.description, metadata=verdict.metadata,
                 ))
-
-        for m in measurements:
-            url = m["url"]
-            measured.add(url)
-
-            if m["error"] is not None:
-                await upsert_alert(
-                    url, "critical", f"Page unreachable — {url}",
-                    f"Could not connect: {m['error']}",
-                    {"page_url": url, "speed_score": 0, "strategy": "desktop"},
-                )
-                continue
-
-            if m["psi"]:
-                psi = m["psi"]
-                score, lcp, cls_val, fid, ttfb = psi["score"], psi["lcp"], psi["cls"], psi["fid"], psi["ttfb"]
-                source = "psi"
-            else:
-                # TTFB-only estimate — do NOT fabricate LCP/CLS from it; zeros
-                # render as "—" instead of polluting Core Web Vitals trends.
-                ttfb = m["ttfb"]
-                score = _score_from_ttfb(ttfb)
-                lcp = 0.0
-                cls_val = 0.0
-                fid = 0.0
-                source = "ttfb"
-            grade = _score_grade(score)
-
-            snapshot = PerformanceSnapshot(
-                site_id=site_id,
-                page_url=url,
-                lcp=lcp,
-                cls=cls_val,
-                fid=fid,
-                ttfb=ttfb,
-                speed_score=score,
-                strategy="desktop",
-            )
-            self.db.add(snapshot)
-
-            meta = {
-                "page_url": url,
-                "speed_score": score,
-                "lcp_ms": round(lcp),
-                "cls": round(cls_val, 3),
-                "fid_ms": round(fid),
-                "ttfb_ms": round(ttfb),
-                "grade": grade,
-                "strategy": "desktop",
-                "source": source,
-            }
-
-            if source == "psi":
-                detail = (
-                    f"PSI desktop score: {score}/100 ({grade}). "
-                    f"LCP: {lcp/1000:.1f}s, CLS: {cls_val:.2f}, TTFB: {ttfb:.0f}ms."
-                )
-            else:
-                detail = (
-                    f"Estimated score: {score}/100 ({grade}) from TTFB {ttfb:.0f}ms "
-                    "— PageSpeed Insights was unavailable for this run."
-                )
-
-            if score < 50:
-                await upsert_alert(url, "critical", f"Poor desktop performance — {url}", detail, meta)
-            elif score < 90:
-                await upsert_alert(url, "warning", f"Desktop performance needs improvement — {url}", detail, meta)
-            else:
-                # Healthy again — clear any previous alert for this page
-                current = existing_by_url.pop(url, None)
-                if current:
-                    stale_ids.append(current.id)
 
         # Alerts for pages this run did NOT measure are deliberately left
         # alone. The measured set is only the homepage plus the top 3 posts by

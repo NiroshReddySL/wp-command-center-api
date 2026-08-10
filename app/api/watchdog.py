@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import re
 from datetime import UTC, datetime
 from typing import Any, Literal
@@ -18,7 +19,17 @@ from app.agents.watchdog.plugin_audit import (
 from app.database.engine import AsyncSessionLocal, get_db
 from app.database.models import Alert, PluginAudit, Site
 from app.security.rate_limit import job_limiter
+from app.services.performance_rescan import (
+    known_urls,
+    remeasure_one,
+    rescan_ceiling,
+    run_bulk_remeasure,
+    select_scope,
+)
+from app.services.performance_rescan import read_progress as read_performance_progress
 from app.utils.background import spawn
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -200,15 +211,11 @@ async def _run_watchdog(site_id: str | None, module: str | None) -> None:
     dismissals — and, when the re-run then failed, left the page reporting
     "no issues found" as though the sites were healthy.
     """
-    import logging
-
     from app.agents.watchdog.link_checker import LinkChecker
     from app.agents.watchdog.performance import PerformanceMonitor
     from app.agents.watchdog.plugin_audit import PluginAuditor
     from app.services.job_executor import AGENT_TIMEOUTS
     from app.services.site_scope import select_monitored_sites
-
-    logger = logging.getLogger(__name__)
 
     failures: list[str] = []
     ran = 0
@@ -297,6 +304,115 @@ async def flush_watchdog(
     await _record_run(db, ran=0, failures=[])  # clears the previous banner
     spawn(_run_watchdog(req.site_id, req.module), name="watchdog-rerun")
     return {"status": "running", "message": "Re-running watchdog in background"}
+
+
+# ── Performance re-measurement ────────────────────────────────────────────────
+#
+# The scheduled sweep rotates a bounded slice per run, so a page can be days
+# from its turn — which means "I just fixed this, show me" had no answer. These
+# two endpoints are that answer: one page now, or every page currently
+# reported. Both go through the same measurement and reconciliation code the
+# agent uses, so a hand-triggered result and a scheduled one cannot disagree.
+
+
+class PerformanceMeasureRequest(BaseModel):
+    site_id: str
+    url: str = Field(min_length=1, max_length=2048)
+
+
+@router.post("/performance/measure", dependencies=[Depends(job_limiter)])
+async def measure_performance_page(
+    payload: PerformanceMeasureRequest, db: AsyncSession = Depends(get_db)
+) -> dict[str, Any]:
+    """Measure one page now and return what it scored.
+
+    Synchronous on purpose: the caller clicked this to see a number, and a
+    single PageSpeed round-trip is seconds, not minutes. The session is
+    released before the network call so the wait does not sit on a pooled
+    connection.
+    """
+    site = await db.get(Site, payload.site_id)
+    if not site:
+        raise HTTPException(status_code=404, detail="Site not found")
+
+    url = payload.url.strip()
+    # This endpoint makes the server fetch a URL the client names. Restricting
+    # it to URLs the site already tracks keeps it from being a general-purpose
+    # fetcher — a public-address check alone would still allow any host.
+    if url not in await known_urls(db, site):
+        raise HTTPException(
+            status_code=422,
+            detail="That URL is not a tracked page of this site",
+        )
+
+    # Ends the read transaction before minutes of network time.
+    await db.rollback()
+
+    try:
+        return await remeasure_one(payload.site_id, url)
+    except Exception as exc:
+        logger.warning("Manual performance measure failed for %s: %s", url, exc)
+        raise HTTPException(status_code=502, detail=f"Measurement failed: {exc}") from exc
+
+
+class PerformanceRescanRequest(BaseModel):
+    site_id: str
+    # "reported" is what the Performance tab lists; "all" is every tracked
+    # page, bounded — see the ceiling in the response.
+    scope: Literal["reported", "all"] = "reported"
+
+
+@router.post("/performance/rescan", dependencies=[Depends(job_limiter)])
+async def rescan_performance(
+    payload: PerformanceRescanRequest, db: AsyncSession = Depends(get_db)
+) -> dict[str, Any]:
+    """Re-measure a whole scope in the background.
+
+    Returns how many pages were queued AND how many were candidates. A batch
+    capped at the ceiling must not read as a complete sweep — that is the
+    difference between "every reported page was re-measured" and "the 200
+    stalest of 1,836 were".
+    """
+    site = await db.get(Site, payload.site_id)
+    if not site:
+        raise HTTPException(status_code=404, detail="Site not found")
+
+    current = await read_performance_progress()
+    if current.get("running"):
+        raise HTTPException(
+            status_code=409,
+            detail="A performance re-measure is already running. Wait for it to finish.",
+        )
+
+    candidates = await select_scope(db, site, payload.scope)
+    if not candidates:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                "No reported pages to re-measure"
+                if payload.scope == "reported"
+                else "No tracked pages for this site"
+            ),
+        )
+
+    ceiling = rescan_ceiling()
+    queued = candidates[:ceiling]
+    spawn(
+        run_bulk_remeasure(payload.site_id, queued, payload.scope),
+        name=f"perf-rescan-{len(queued)}",
+    )
+    return {
+        "queued": len(queued),
+        "candidates": len(candidates),
+        "truncated": len(candidates) > len(queued),
+        "scope": payload.scope,
+    }
+
+
+@router.get("/performance/rescan/status")
+async def performance_rescan_status() -> dict[str, Any]:
+    """Progress of the current or most recent performance re-measure."""
+    return await read_performance_progress()
 
 
 # ── Component inventory ───────────────────────────────────────────────────────

@@ -44,6 +44,12 @@ class Settings(BaseSettings):
     # A page measured within this window is fresh enough to skip, which is
     # what lets the rotation reach pages it has never seen.
     PSI_FRESH_HOURS: int = 72
+    # Ceiling on a hand-triggered re-measure. The rotation exists because a
+    # full sweep of an enterprise library cannot fit in one run at keyless
+    # PSI rates — asking for "everything" has to mean a bounded batch, and
+    # the response says how many of the candidates it actually took so a
+    # truncated request never passes for a complete one.
+    PSI_RESCAN_MAX_PAGES: int = 200
 
     # ── Watchdog scale limits (enterprise sites) ─────────────────────────────
     # Posts/pages themselves are fetched uncapped (see WordPressConnector) —
