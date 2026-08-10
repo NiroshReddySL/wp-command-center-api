@@ -32,6 +32,18 @@ class Settings(BaseSettings):
     # Google PageSpeed Insights API key — optional; raises the quota from
     # ~25 req/100s (per IP, keyless) to 25k/day so perf checks stop flaking.
     PSI_API_KEY: str = ""
+    # How many pages one performance run measures. Bounded so a run stays
+    # short and predictable regardless of library size: coverage comes from
+    # rotating across runs, not from doing everything at once.
+    PSI_MAX_PAGES_PER_RUN: int = 12
+    # Simultaneous PageSpeed calls. Keyless PSI allows roughly 25 requests
+    # per 100 seconds per IP, so anything higher just earns 429s; a key
+    # raises the ceiling to 25k/day and the concurrency with it.
+    PSI_CONCURRENCY: int = 2
+    PSI_CONCURRENCY_WITH_KEY: int = 6
+    # A page measured within this window is fresh enough to skip, which is
+    # what lets the rotation reach pages it has never seen.
+    PSI_FRESH_HOURS: int = 72
 
     # ── Watchdog scale limits (enterprise sites) ─────────────────────────────
     # Posts/pages themselves are fetched uncapped (see WordPressConnector) —
