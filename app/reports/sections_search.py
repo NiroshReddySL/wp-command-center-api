@@ -13,7 +13,7 @@ from typing import Any
 from sqlalchemy import select
 
 from app.reports.analysed import ANALYSED
-from app.reports.context import SEARCH_DAYS, ReportContext
+from app.reports.context import ReportContext
 from app.reports.models import Finding, Metric, Section, Table
 
 # Where a page can realistically move with metadata and content work alone.
@@ -44,9 +44,10 @@ async def build_search(ctx: ReportContext) -> Section:
         f"{impressions:,} impressions produced {clicks:,} clicks over {days} days, "
         f"a {ctr:.2f}% click-through rate."
     )
+    basis = f"Search Console total over {days} days with data in {ctx.period.label}"
     section.metrics = [
-        Metric("Impressions", impressions, f"Search Console total over {days} days"),
-        Metric("Clicks", clicks, f"Search Console total over {days} days"),
+        Metric("Impressions", impressions, basis),
+        Metric("Clicks", clicks, basis),
         Metric("Click-through rate", round(ctr, 2),
                "total clicks divided by total impressions", unit="%",
                sub="not a mean of daily rates"),
@@ -58,6 +59,15 @@ async def build_search(ctx: ReportContext) -> Section:
         "Click-through rate is computed from period totals. A mean of daily rates would "
         "weight a quiet day the same as a busy one and read differently for the same data."
     )
+    shortfall = ctx.period.shortfall_note(days)
+    if shortfall:
+        # Search Console finalises 2-3 days late, so a period ending today is
+        # always short. Reporting the total without saying so understates it
+        # silently, which reads as a decline that did not happen.
+        section.notes.append(
+            f"{shortfall} Search Console finalises data two to three days in arrears, so a "
+            "period ending recently will always be missing its most recent days."
+        )
 
     queries = ctx.search_queries or []
     if queries:
@@ -173,12 +183,13 @@ async def build_conversion(ctx: ReportContext) -> Section:
 
     total_views = sum(_int(p, "views", "pageviews", "screenPageViews") for p in pages)
     section.headline = (
-        f"The {len(pages)} busiest pages drew {total_views:,} views over {SEARCH_DAYS} days."
+        f"The {len(pages)} busiest pages drew {total_views:,} views over "
+        f"{ctx.period.days} days."
     )
     section.metrics = [
         Metric("Pages measured", len(pages), "landing pages returned by Analytics"),
         Metric("Views across them", total_views,
-               f"sum of views for these pages over {SEARCH_DAYS} days"),
+               f"sum of views for these pages over {ctx.period.label}"),
     ]
     section.tables.append(Table(
         "Busiest landing pages",
@@ -188,7 +199,7 @@ async def build_conversion(ctx: ReportContext) -> Section:
              f"{_int(p, 'views', 'pageviews', 'screenPageViews'):,}")
             for p in pages
         ),
-        note="Ranked by Analytics views over the reporting period.",
+        note=f"Ranked by Analytics views over {ctx.period.label}.",
     ))
     section.notes.append(
         "These are the busiest pages, not the most valuable ones. Ranking by views says "
@@ -351,10 +362,17 @@ async def build_markets(ctx: ReportContext) -> Section:
     )
     from app.database.models import TrafficSnapshot
 
+    # Bounded by the period's dates rather than by "the most recent N rows":
+    # a limit takes whatever exists, which for a past period is the wrong
+    # days entirely.
     snaps = (await ctx.db.execute(
         select(TrafficSnapshot)
-        .where(TrafficSnapshot.site_id == ctx.site.id)
-        .order_by(TrafficSnapshot.date.desc()).limit(SEARCH_DAYS)
+        .where(
+            TrafficSnapshot.site_id == ctx.site.id,
+            TrafficSnapshot.date >= ctx.period.start_iso,
+            TrafficSnapshot.date <= ctx.period.end_iso,
+        )
+        .order_by(TrafficSnapshot.date.desc())
     )).scalars().all()
 
     countries: Counter[str] = Counter()
@@ -365,7 +383,7 @@ async def build_markets(ctx: ReportContext) -> Section:
 
     if not countries:
         section.unavailable = (
-            "No country breakdown recorded in the traffic snapshots for this period."
+            f"No country breakdown recorded in the traffic snapshots for {ctx.period.label}."
         )
         return section
 

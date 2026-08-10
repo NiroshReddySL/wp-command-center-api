@@ -18,6 +18,7 @@ from app.database.engine import get_db
 from app.database.models import ReviewItem, Site
 from app.reports.builder import REPORT_ACTION_TYPE, generate_and_store
 from app.reports.html import render_report
+from app.reports.period import DEFAULT_RANGE, Period
 from app.security.auth import require_user
 from app.security.rate_limit import job_limiter
 from app.services.site_scope import select_monitored_sites
@@ -30,6 +31,12 @@ class ReportSummary(BaseModel):
     site_id: str
     title: str
     generated_at: datetime
+    # Which period the report covers, distinct from when it was run. Two
+    # reports generated the same afternoon can cover different months, and a
+    # list keyed only on generation time cannot tell them apart.
+    period_label: str = ""
+    period_start: str = ""
+    period_end: str = ""
     severity_counts: dict[str, int] = {}
     unavailable_sources: int = 0
 
@@ -67,6 +74,12 @@ async def list_reports(
             "site_id": item.site_id,
             "title": (item.payload or {}).get("title", "Site Report"),
             "generated_at": item.created_at,
+            # Reports predating the period picker have no label stored; fall
+            # back to their raw dates rather than showing an empty chip.
+            "period_label": _payload(item).get("period_label")
+            or f"{_payload(item).get('period_start', '')} → {_payload(item).get('period_end', '')}",
+            "period_start": _payload(item).get("period_start", ""),
+            "period_end": _payload(item).get("period_end", ""),
             "severity_counts": _payload(item).get("severity_counts", {}),
             "unavailable_sources": sum(
                 1 for s in _payload(item).get("sources", []) if not s.get("available")
@@ -91,8 +104,11 @@ async def export_report(report_id: str, db: AsyncSession = Depends(get_db)) -> H
     if not data:
         raise HTTPException(status_code=409, detail="This report has no stored content")
 
+    # Named for the period it covers, not the day it was exported — the same
+    # report downloaded twice must not produce two differently-named files.
     site = (data.get("site_name") or "site").lower().replace(" ", "-")
-    filename = f"{site}-report-{str(data.get('generated_at', ''))[:10]}.html"
+    span = f"{data.get('period_start', '')}-to-{data.get('period_end', '')}".strip("-")
+    filename = f"{site}-report-{span or str(data.get('generated_at', ''))[:10]}.html"
     return HTMLResponse(
         content=render_report(data),
         headers={"Content-Disposition": f'inline; filename="{filename}"'},
@@ -101,18 +117,27 @@ async def export_report(report_id: str, db: AsyncSession = Depends(get_db)) -> H
 
 class GenerateRequest(BaseModel):
     site_id: str | None = None  # omit to generate for every monitored site
+    # The same preset keys every other range control uses, so "last 28 days"
+    # in a report and on a dashboard resolve to identical dates.
+    range: str = DEFAULT_RANGE
+    start_date: str | None = None   # required, with end_date, when range=custom
+    end_date: str | None = None
 
 
 @router.post("", dependencies=[Depends(job_limiter)])
 async def generate(
     payload: GenerateRequest, db: AsyncSession = Depends(get_db)
 ) -> dict[str, Any]:
-    """Build a report from current data and freeze it.
+    """Build a report for a period and freeze it.
 
     Runs inline rather than detached: generation is a handful of aggregate
-    queries with no external calls, so it finishes in well under a second and
-    the caller can be handed the report it just asked for.
+    queries plus the Search Console and Analytics pulls, so the caller can be
+    handed the report it just asked for.
     """
+    # Raises 422 with the specific problem — a custom range missing a date is
+    # a request error, not something to silently substitute a default for.
+    period = Period.from_request(payload.range, payload.start_date, payload.end_date)
+
     query = select_monitored_sites()
     if payload.site_id:
         query = query.where(Site.id == payload.site_id)
@@ -120,9 +145,12 @@ async def generate(
     if not sites:
         raise HTTPException(status_code=404, detail="No monitored sites to report on")
 
-    created = [await generate_and_store(db, site) for site in sites]
+    created = [await generate_and_store(db, site, period) for site in sites]
     return {
         "generated": len(created),
         "report_ids": [item.id for item in created],
         "site_ids": [item.site_id for item in created],
+        "period_start": period.start_iso,
+        "period_end": period.end_iso,
+        "period_label": period.label,
     }

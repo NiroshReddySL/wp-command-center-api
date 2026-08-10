@@ -10,13 +10,14 @@ that changes after the report was sent is worse than no figure — someone acts
 on the version they were given, and it has to still say what it said.
 """
 import logging
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.models import ReviewItem, Site
 from app.reports.context import build_context
 from app.reports.models import Report, Section
+from app.reports.period import Period
 from app.reports.sections import BUILDERS
 from app.reports.sections_exec import build_backlog, build_executive, build_roadmap
 from app.reports.sections_search import (
@@ -33,21 +34,27 @@ REPORT_ACTION_TYPE = "site_report"
 REPORT_PERIOD_DAYS = 28
 
 
-async def build_report(db: AsyncSession, site: Site) -> Report:
+async def build_report(
+    db: AsyncSession, site: Site, period: Period | None = None
+) -> Report:
     """Every section the available data supports, plus the gaps as stated facts."""
     now = datetime.now(UTC)
+    period = period or Period.last_days(REPORT_PERIOD_DAYS)
     sources = await probe_all(db, site)
 
     report = Report(
         site_name=site.name,
         site_url=site.url,
-        period_start=(now - timedelta(days=REPORT_PERIOD_DAYS)).date().isoformat(),
-        period_end=now.date().isoformat(),
+        period_start=period.start_iso,
+        period_end=period.end_iso,
+        period_label=period.label,
+        period_days=period.days,
+        scope_note=period.scope_note(now),
         generated_at=now,
         sources=sources,
     )
 
-    ctx = await build_context(db, site, sources)
+    ctx = await build_context(db, site, sources, period)
 
     async def run(name: str, coro) -> None:
         try:
@@ -62,7 +69,7 @@ async def build_report(db: AsyncSession, site: Site) -> Report:
             ))
 
     for build in BUILDERS:
-        await run(build.__name__.removeprefix("build_"), build(db, site.id, sources))
+        await run(build.__name__.removeprefix("build_"), build(db, site.id, sources, period))
     for build in (build_search, build_conversion, build_metadata, build_markets):
         await run(build.__name__.removeprefix("build_"), build(ctx))
 
@@ -74,6 +81,13 @@ async def build_report(db: AsyncSession, site: Site) -> Report:
     report.sections.insert(0, build_executive(report))
     report.sections.append(build_roadmap(report))
     report.sections.append(build_backlog(report))
+
+    # The builders' own numbers are sort keys, not labels — "90" and "91"
+    # exist only to force the closing sections last. Once the order is final
+    # they are renumbered in reading order, because a printed contents list
+    # that jumps 05, 06, 90, 91 reads as a document with pages missing.
+    for index, section in enumerate(report.sections, start=1):
+        section.number = f"{index:02d}"
     return report
 
 
@@ -84,8 +98,11 @@ async def store_report(db: AsyncSession, site: Site, report: Report) -> ReviewIt
         action_type=REPORT_ACTION_TYPE,
         site_id=site.id,
         status="pending",
+        # The period, not the generation date: two reports built the same
+        # afternoon for March and for April are different documents, and a
+        # title naming only when they were run cannot tell them apart.
         payload={
-            "title": f"{site.name} — Site Report — {report.generated_at.strftime('%d %b %Y')}",
+            "title": f"{site.name} — Site Report — {report.period_label}",
             "report": report.to_dict(),
         },
     )
@@ -94,8 +111,10 @@ async def store_report(db: AsyncSession, site: Site, report: Report) -> ReviewIt
     return item
 
 
-async def generate_and_store(db: AsyncSession, site: Site) -> ReviewItem:
-    return await store_report(db, site, await build_report(db, site))
+async def generate_and_store(
+    db: AsyncSession, site: Site, period: Period | None = None
+) -> ReviewItem:
+    return await store_report(db, site, await build_report(db, site, period))
 
 
 __all__ = ["REPORT_ACTION_TYPE", "REPORT_PERIOD_DAYS", "build_report",

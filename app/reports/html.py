@@ -10,6 +10,7 @@ where things sit on the page; it never computes, rounds or reinterprets a
 figure, because a renderer that does arithmetic is a second place for the
 numbers to disagree.
 """
+from datetime import datetime
 from html import escape
 from typing import Any
 
@@ -35,12 +36,36 @@ nav h3{font-size:.66rem;text-transform:uppercase;letter-spacing:.15em;color:#707
 nav a{display:block;padding:5px 8px;border-radius:6px;text-decoration:none;color:#3c4658;font-size:.76rem}
 nav a:hover{background:#E1ECFF;color:#0129AC}
 .lead{font-size:1.02rem;color:#3c4658;max-width:760px;margin:.2em 0 1em}
-.cover{padding:64px 56px;color:#fff;background:linear-gradient(140deg,#0129AC,#001a6e 70%,#00113f)}
+.cover{padding:56px 56px 48px;color:#fff;
+ background:linear-gradient(140deg,#0129AC,#001a6e 70%,#00113f)}
+.brandbar{display:flex;align-items:center;gap:11px;padding-bottom:16px}
+.mark{width:27px;height:27px;border-radius:7px;background:#fff;color:#0129AC;flex:none;
+ display:flex;align-items:center;justify-content:center;font-weight:900;font-size:.72rem;
+ letter-spacing:-.04em;print-color-adjust:exact;-webkit-print-color-adjust:exact}
 .eyebrow{text-transform:uppercase;letter-spacing:.16em;font-weight:800;font-size:.7rem;color:#809EFC}
-h1{font-size:2.6rem;line-height:1.05;letter-spacing:-.03em;margin:.3em 0 .25em}
-.dek{font-size:1.05rem;color:#dce4ff;max-width:640px;margin:0}
-.cover-meta{display:flex;flex-wrap:wrap;gap:28px;margin-top:40px;font-size:.82rem;color:#bfc9ea}
-.cover-meta b{display:block;color:#fff;font-size:.98rem;font-weight:600}
+h1{font-size:2.7rem;line-height:1.04;letter-spacing:-.03em;margin:.5em 0 .1em}
+.period{font-size:1.3rem;font-weight:600;letter-spacing:-.01em;color:#fff;margin:0}
+.cover .site{font-size:.86rem;color:#bfc9ea;margin:.5em 0 0;word-break:break-all}
+.dek{font-size:1.02rem;color:#dce4ff;max-width:640px;margin:1.1em 0 0}
+.cover-meta{display:grid;grid-template-columns:repeat(4,1fr);gap:20px;margin-top:34px;
+ padding-top:20px;border-top:1px solid #ffffff33;font-size:.75rem;color:#bfc9ea}
+.cover-meta b{display:block;color:#fff;font-size:1.02rem;font-weight:700;
+ letter-spacing:-.01em;margin-bottom:3px}
+.chips{display:flex;flex-wrap:wrap;gap:8px;margin-top:20px}
+.chip{display:flex;align-items:center;gap:7px;border:1px solid #ffffff40;border-radius:999px;
+ padding:5px 13px 5px 9px;font-size:.74rem;color:#fff;white-space:nowrap}
+/* Border AND background in the same colour: on screen it reads as a solid
+   dot, and with "Background graphics" off — the print dialog's default — the
+   ring still draws. The chip's label carries the severity either way, so
+   colour is never the only signal. */
+.chip i{width:9px;height:9px;border-radius:50%;flex:none;border:2px solid;
+ print-color-adjust:exact;-webkit-print-color-adjust:exact}
+.chip b{font-weight:800}
+/* The screen has a sticky sidebar for this; print has nothing, so the cover
+   carries the contents instead of the document having none. */
+.toc{display:none}
+.cover-foot{margin-top:30px;padding-top:16px;border-top:1px solid #ffffff26;
+ font-size:.71rem;color:#a9b6e0;max-width:80ch;line-height:1.65}
 main{padding:40px 48px 72px;min-width:0}
 section{padding:26px 0 40px;border-bottom:1px solid #E2E8F0}
 section:last-child{border-bottom:0}
@@ -84,7 +109,35 @@ td:first-child{max-width:26rem;overflow-wrap:anywhere}
  body{background:#fff}.page{box-shadow:none;max-width:none}
  .layout{display:block}nav{display:none}
  main{padding:0}
- .cover{break-after:page}
+ /* The cover was white text on a gradient. Browsers do not print background
+    graphics by default, so the first page came out blank — and even with
+    them on it was a band of text at the top of an otherwise empty sheet.
+    Print gets its own skin: dark ink on white, brand presence carried by
+    rules and borders (which always print), filling the page properly. */
+ .cover{background:#fff;color:#2E2E2E;padding:0;break-after:page;
+  min-height:100vh;display:flex;flex-direction:column}
+ .brandbar{border-bottom:3px solid #0129AC;padding-bottom:13px}
+ /* Outlined rather than filled: a filled mark with backgrounds off leaves
+    white letters on white paper. A border always prints. */
+ .mark{background:none;color:#0129AC;border:2px solid #0129AC}
+ .eyebrow{color:#0129AC}
+ .cover h1{color:#14203a;font-size:3.1rem;margin-top:1em}
+ .period{color:#0129AC}
+ .cover .site{color:#707070}
+ .dek{color:#3c4658}
+ /* Pushed to the foot of the page, so the cover reads title-then-facts down
+    a full sheet rather than crowding into the top third. */
+ .cover-meta{margin-top:auto;border-top:1px solid #C9D4E4;color:#707070}
+ .cover-meta b{color:#14203a}
+ .chip{border-color:#C9D4E4;color:#2E2E2E}
+ .cover-foot{border-top:1px solid #E2E8F0;color:#707070}
+ .toc{display:block;margin-top:26px;padding-top:18px;border-top:1px solid #E2E8F0}
+ .toc h3{font-size:.66rem;text-transform:uppercase;letter-spacing:.15em;color:#707070;
+  margin:0 0 10px;font-weight:800}
+ .toc ol{columns:2;column-gap:34px;margin:0;padding:0;list-style:none;
+  font-size:.78rem;color:#3c4658}
+ .toc li{break-inside:avoid;padding:3px 0;display:flex;gap:9px}
+ .toc span{color:#0129AC;font-weight:700;font-variant-numeric:tabular-nums}
  /* Each section starts its own page, as in a printed deliverable. */
  section{break-before:page;break-inside:auto;border:0;padding-top:6px}
  section:first-child{break-before:avoid}
@@ -212,34 +265,91 @@ def _sources(sources: list[dict]) -> str:
     )
 
 
+def _on_date(iso: Any) -> str:
+    """"10 Aug 2026", matching how the period reads. A raw ISO stamp beside a
+    formatted period label looks like two different kinds of date."""
+    try:
+        return datetime.fromisoformat(str(iso)).strftime("%d %b %Y")
+    except (TypeError, ValueError):
+        return str(iso or "")[:10]
+
+
+def _chips(counts: dict) -> str:
+    """Findings by severity. Each carries its label, so severity is never
+    conveyed by colour alone."""
+    present = [
+        (label, colour, counts.get(key, 0))
+        for key, (label, _bg, colour) in _SEVERITY_STYLE.items()
+        if counts.get(key)
+    ]
+    if not present:
+        return '<div class="chips"><div class="chip">No findings raised</div></div>'
+    return '<div class="chips">' + "".join(
+        f'<div class="chip"><i style="background:{colour};border-color:{colour}"></i>'
+        f"<b>{count}</b> {_e(label.lower())}</div>"
+        for label, colour, count in present
+    ) + "</div>"
+
+
+def _toc(sections: list[dict]) -> str:
+    """Printed contents. The screen has a sticky sidebar for this; print hides
+    it, which left the printed document with no way in at all."""
+    items = "".join(
+        f'<li><span>{_e(s.get("number"))}</span>{_e(s.get("title"))}</li>'
+        for s in sections
+    )
+    return (
+        f'<div class="toc"><h3>What is inside</h3><ol>{items}'
+        "<li><span>—</span>Appendix · Data coverage</li></ol></div>"
+    )
+
+
+def _cover(data: dict, sections: list[dict]) -> str:
+    counts = data.get("severity_counts", {})
+    total = sum(int(v or 0) for v in counts.values())
+    sources = data.get("sources", [])
+    available = sum(1 for s in sources if s.get("available"))
+    period = data.get("period_label") or (
+        f'{data.get("period_start", "")} → {data.get("period_end", "")}'
+    )
+    days = data.get("period_days") or 0
+    generated = _on_date(data.get("generated_at"))
+    scope = data.get("scope_note") or ""
+
+    return f"""<header class="cover">
+<div class="brandbar"><div class="mark">WP</div>
+<div class="eyebrow">WP Command Center · Site Report</div></div>
+<h1>{_e(data.get("site_name"))}</h1>
+<p class="period">{_e(period)}</p>
+<p class="site">{_e(data.get("site_url"))}</p>
+<p class="dek">Every figure in this report is computed from measured data and states what it
+counted. Where something could not be measured, it says so instead of reporting zero.</p>
+{_chips(counts)}
+<div class="cover-meta">
+<div><b>{_e(f"{days} days") if days else "—"}</b>Period length</div>
+<div><b>{_e(generated)}</b>Generated</div>
+<div><b>{total or "None"}</b>Findings raised</div>
+<div><b>{available} of {len(sources)}</b>Data sources available</div>
+</div>
+{_toc(sections)}
+<p class="cover-foot">{_e(scope)} Nothing in this document is estimated, inferred or
+generated: every number is the result of a query, and the appendix lists exactly which
+sources answered and which did not.</p>
+</header>"""
+
+
 def render_report(data: dict) -> str:
     """A complete, standalone HTML document from a stored report snapshot."""
-    counts = data.get("severity_counts", {})
-    summary = " · ".join(
-        f"{counts.get(k, 0)} {label}"
-        for k, label in (("critical", "critical"), ("high", "high"),
-                         ("medium", "medium"), ("opportunity", "opportunities"))
-        if counts.get(k)
-    ) or "No findings"
-    sections = "".join(_section(s) for s in data.get("sections", []))
+    section_data = data.get("sections", [])
+    sections = "".join(_section(s) for s in section_data)
     title = f"{data.get('site_name', 'Site')} — Site Report"
     return f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{_e(title)}</title><style>{_CSS}</style></head>
 <body><div class="page">
-<header class="cover">
-<div class="eyebrow">WP Command Center</div>
-<h1>{_e(data.get("site_name"))} — Site Report</h1>
-<p class="dek">Every figure in this report is computed from measured data and states what it
-counted. Where something could not be measured, it says so instead of reporting zero.</p>
-<div class="cover-meta">
-<div><b>{_e(data.get("period_start"))} → {_e(data.get("period_end"))}</b>Reporting period</div>
-<div><b>{_e(str(data.get("generated_at", ""))[:10])}</b>Generated</div>
-<div><b>{_e(summary)}</b>Findings</div>
-<div><b>{_e(data.get("site_url"))}</b>Site</div>
-</div></header>
-<div class="layout">{_contents(data.get("sections", []))}
+{_cover(data, section_data)}
+<div class="layout">{_contents(section_data)}
 <main>{sections}{_sources(data.get("sources", []))}</main></div>
 </div></body></html>"""
 

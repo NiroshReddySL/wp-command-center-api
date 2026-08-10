@@ -16,6 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.models import OAuthToken, Site, SiteConfig
 from app.reports.models import SourceStatus
+from app.reports.period import Period
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +29,10 @@ class ReportContext:
     db: AsyncSession
     site: Site
     sources: list[SourceStatus]
+    # The window every figure below was fetched for. Held here rather than
+    # rederived per section, so a section cannot describe a different span
+    # from the one the report is titled with.
+    period: Period = field(default_factory=lambda: Period.last_days(SEARCH_DAYS))
 
     # Live pulls. Empty list means "fetched, nothing there"; None means the
     # fetch did not happen or failed — the two must stay distinguishable.
@@ -71,9 +76,11 @@ class ReportContext:
 
 
 async def build_context(
-    db: AsyncSession, site: Site, sources: list[SourceStatus]
+    db: AsyncSession, site: Site, sources: list[SourceStatus],
+    period: Period | None = None,
 ) -> ReportContext:
-    ctx = ReportContext(db=db, site=site, sources=sources)
+    period = period or Period.last_days(SEARCH_DAYS)
+    ctx = ReportContext(db=db, site=site, sources=sources, period=period)
 
     token = (await db.execute(
         select(OAuthToken).where(OAuthToken.provider == "google")
@@ -108,8 +115,14 @@ async def build_context(
 
         gsc = await SearchConsoleConnector.from_refresh_token(token.refresh_token)
         ctx.search_daily, ctx.search_queries = await asyncio.gather(
-            gsc.get_daily_search_metrics(config.gsc_site_url, days=SEARCH_DAYS),
-            gsc.get_top_queries(config.gsc_site_url, days=SEARCH_DAYS, limit=QUERY_LIMIT),
+            gsc.get_daily_search_metrics(
+                config.gsc_site_url,
+                start_date=period.start_iso, end_date=period.end_iso,
+            ),
+            gsc.get_top_queries(
+                config.gsc_site_url, limit=QUERY_LIMIT,
+                start_date=period.start_iso, end_date=period.end_iso,
+            ),
         )
 
     async def pull_ga() -> None:
@@ -117,7 +130,8 @@ async def build_context(
 
         ga = await AnalyticsConnector.from_refresh_token(token.refresh_token)
         ctx.ga_top_pages = await ga.get_top_pages(
-            config.ga_property_id, days=SEARCH_DAYS, limit=15
+            config.ga_property_id, limit=15,
+            start_date=period.start_iso, end_date=period.end_iso,
         )
 
     jobs = []

@@ -25,6 +25,7 @@ from app.database.models import (
 )
 from app.reports.analysed import ANALYSED
 from app.reports.models import Finding, Metric, Section, SourceStatus, Table
+from app.reports.period import Period
 
 _CWV_GOOD_SCORE = 90
 _CWV_POOR_SCORE = 50
@@ -43,7 +44,7 @@ def _source(sources: list[SourceStatus], key: str) -> SourceStatus | None:
 # ── 01 Security & components ─────────────────────────────────────────────────
 
 async def build_security(
-    db: AsyncSession, site_id: str, sources: list[SourceStatus]
+    db: AsyncSession, site_id: str, sources: list[SourceStatus], period: Period
 ) -> Section:
     rows = (await db.execute(
         select(PluginAudit).where(PluginAudit.site_id == site_id)
@@ -190,7 +191,7 @@ async def build_security(
 # ── 02 Site health & technical debt ──────────────────────────────────────────
 
 async def build_health(
-    db: AsyncSession, site_id: str, sources: list[SourceStatus]
+    db: AsyncSession, site_id: str, sources: list[SourceStatus], period: Period
 ) -> Section:
     alerts = (await db.execute(
         select(Alert).where(
@@ -216,10 +217,16 @@ async def build_health(
     )
 
     psi = _source(sources, "psi")
-    since = datetime.now(UTC) - timedelta(days=30)
+    # Scoped to the reporting period like any other measurement series: a
+    # report for March that quoted this month's PageSpeed scores would be
+    # stating a number the period never produced.
     snaps = (await db.execute(
         select(PerformanceSnapshot)
-        .where(PerformanceSnapshot.site_id == site_id, PerformanceSnapshot.snapshot_at >= since)
+        .where(
+            PerformanceSnapshot.site_id == site_id,
+            PerformanceSnapshot.snapshot_at >= period.start_dt,
+            PerformanceSnapshot.snapshot_at < period.end_dt,
+        )
         .order_by(PerformanceSnapshot.snapshot_at.desc())
     )).scalars().all()
 
@@ -236,7 +243,8 @@ async def build_health(
         poor = [p for p in pages if p.speed_score < _CWV_POOR_SCORE]
         section.metrics.append(
             Metric("Median PageSpeed", median_score,
-                   f"median of the most recent Lighthouse score for each of {len(pages)} pages",
+                   f"median of the most recent Lighthouse score for each of {len(pages)} "
+                   f"pages measured during {period.label}",
                    sub=f"{len(pages)} page(s) measured")
         )
         section.tables.append(Table(
@@ -269,6 +277,13 @@ async def build_health(
             f"PageSpeed coverage: {psi.coverage}. TTFB estimates are excluded from every "
             "score above; mixing them with Lighthouse runs would describe neither."
         )
+    # The two halves of this section answer different questions, and saying
+    # which is which is the difference between a figure and a guess.
+    section.notes.append(
+        f"Speed figures cover pages measured during {period.label}. Finding counts are "
+        "the site's current state — an alert is open or it is not, and there is no "
+        "stored history that could reconstruct what was open during a past period."
+    )
 
     if broken:
         section.findings.append(Finding(
@@ -299,7 +314,7 @@ async def build_health(
 # ── 03 Content portfolio ─────────────────────────────────────────────────────
 
 async def build_content(
-    db: AsyncSession, site_id: str, sources: list[SourceStatus]
+    db: AsyncSession, site_id: str, sources: list[SourceStatus], period: Period
 ) -> Section:
     source = _source(sources, "content")
     section = Section(
@@ -396,7 +411,7 @@ async def build_content(
 # ── 02 Traffic trend ──────────────────────────────────────────────────────
 
 async def build_traffic(
-    db: AsyncSession, site_id: str, sources: list[SourceStatus]
+    db: AsyncSession, site_id: str, sources: list[SourceStatus], period: Period
 ) -> Section:
     section = Section(
         key="traffic", number="02", title="Traffic Trend",
@@ -412,14 +427,17 @@ async def build_traffic(
         section.unavailable = reason
         return section
 
-    since = (datetime.now(UTC) - timedelta(days=28)).date().isoformat()
     snaps = (await db.execute(
         select(TrafficSnapshot)
-        .where(TrafficSnapshot.site_id == site_id, TrafficSnapshot.date >= since)
+        .where(
+            TrafficSnapshot.site_id == site_id,
+            TrafficSnapshot.date >= period.start_iso,
+            TrafficSnapshot.date <= period.end_iso,
+        )
         .order_by(TrafficSnapshot.date)
     )).scalars().all()
     if not snaps:
-        section.unavailable = "No traffic snapshots recorded in the last 28 days."
+        section.unavailable = f"No traffic snapshots recorded between {period.label}."
         return section
 
     sessions = sum(s.sessions for s in snaps)
@@ -442,13 +460,12 @@ async def build_traffic(
     ]
     section.notes.append(
         "Daily figures are summed, so a visitor returning on three days counts three times. "
-        "This is not the same as a deduplicated 28-day user count and should not be compared "
-        "with one."
+        f"This is not the same as a deduplicated {period.days}-day user count and should not "
+        "be compared with one."
     )
-    if days < 28:
-        section.notes.append(
-            f"Only {days} of the last 28 days have snapshots, so totals understate the period."
-        )
+    shortfall = period.shortfall_note(days)
+    if shortfall:
+        section.notes.append(shortfall)
 
     pages: Counter[str] = Counter()
     for snap in snaps:

@@ -123,6 +123,14 @@ class Report:
     period_start: str
     period_end: str
     generated_at: datetime
+    # Rendered once at build time so the stored snapshot carries the wording
+    # the report was issued with, rather than leaving each renderer to format
+    # the dates its own way and drift apart.
+    period_label: str = ""
+    period_days: int = 0
+    # Which sections cover the period and which describe the site now. Without
+    # it a reader reasonably assumes the whole document is period-scoped.
+    scope_note: str = ""
     sources: list[SourceStatus] = field(default_factory=list)
     sections: list[Section] = field(default_factory=list)
 
@@ -152,6 +160,9 @@ class Report:
             "site_url": self.site_url,
             "period_start": self.period_start,
             "period_end": self.period_end,
+            "period_label": self.period_label or f"{self.period_start} → {self.period_end}",
+            "period_days": self.period_days,
+            "scope_note": self.scope_note,
             "generated_at": self.generated_at.isoformat(),
             "severity_counts": self.severity_counts(),
             "sources": [_clean(asdict(s)) for s in self.sources],

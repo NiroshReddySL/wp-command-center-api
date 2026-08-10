@@ -10,6 +10,21 @@ _TOKEN_URL = "https://oauth2.googleapis.com/token"
 _GSC_BASE = "https://www.googleapis.com/webmasters/v3"
 
 
+def _window(
+    days: int, start_date: str | None, end_date: str | None
+) -> tuple[str, str]:
+    """An explicit window if given, otherwise the last `days` ending today.
+
+    Both forms exist because both are real: dashboards ask for "the last 28
+    days" and want that to move, while a report for a named period must
+    resolve to the same dates however long after the fact it is rebuilt.
+    """
+    if start_date and end_date:
+        return start_date, end_date
+    end = datetime.now(UTC).date()
+    return str(end - timedelta(days=days)), str(end)
+
+
 async def _refresh_access_token(refresh_token: str) -> str:
     async with httpx.AsyncClient() as client:
         resp = await client.post(
@@ -38,18 +53,22 @@ class SearchConsoleConnector:
         return {"Authorization": f"Bearer {self.access_token}"}
 
     async def get_top_queries(
-        self, site_url: str, days: int = 90, limit: int = 100
+        self, site_url: str, days: int = 90, limit: int = 100,
+        *, start_date: str | None = None, end_date: str | None = None,
     ) -> list[dict[str, Any]]:
         """
         Fetch top queries with clicks, impressions, CTR, and avg position.
         Returns list of { query, clicks, impressions, ctr, position }.
+
+        `days` means the last N days ending today. Pass start_date/end_date
+        instead for an arbitrary window — a report covering last March cannot
+        be expressed as "N days ago" without drifting every time it is run.
         """
-        end = datetime.now(UTC).date()
-        start = end - timedelta(days=days)
+        start, end = _window(days, start_date, end_date)
 
         body = {
-            "startDate": str(start),
-            "endDate": str(end),
+            "startDate": start,
+            "endDate": end,
             "dimensions": ["query"],
             "rowLimit": limit,
             "orderBy": [{"fieldName": "impressions", "sortOrder": "DESCENDING"}],
@@ -76,7 +95,8 @@ class SearchConsoleConnector:
         ]
 
     async def get_daily_search_metrics(
-        self, site_url: str, days: int = 90
+        self, site_url: str, days: int = 90,
+        *, start_date: str | None = None, end_date: str | None = None,
     ) -> list[dict[str, Any]]:
         """Day-by-day organic search performance, in ONE call.
 
@@ -92,12 +112,11 @@ class SearchConsoleConnector:
         simply absent from the response rather than zero — callers must not
         read a missing day as "no traffic".
         """
-        end = datetime.now(UTC).date()
-        start = end - timedelta(days=days)
+        start, end = _window(days, start_date, end_date)
 
         body = {
-            "startDate": str(start),
-            "endDate": str(end),
+            "startDate": start,
+            "endDate": end,
             "dimensions": ["date"],
             # One row per day; comfortably above any `days` we'd request.
             "rowLimit": 500,

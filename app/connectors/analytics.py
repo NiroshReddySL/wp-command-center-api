@@ -151,13 +151,26 @@ class AnalyticsConnector:
 
         return result
 
-    async def get_top_pages(self, property_id: str, days: int = 30, limit: int = 10) -> list[dict[str, Any]]:
-        """Fetch top pages by page views."""
+    async def get_top_pages(
+        self, property_id: str, days: int = 30, limit: int = 10,
+        *, start_date: str | None = None, end_date: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Fetch top pages by page views.
+
+        `days` means the last N days ending today. Pass start_date/end_date
+        for an arbitrary window — a report for a named past period cannot be
+        expressed relative to today without drifting each time it is built.
+        """
         if not property_id.startswith("properties/"):
             property_id = f"properties/{property_id}"
 
+        window = (
+            {"startDate": start_date, "endDate": end_date}
+            if start_date and end_date
+            else {"startDate": f"{days}daysAgo", "endDate": "today"}
+        )
         body = {
-            "dateRanges": [{"startDate": f"{days}daysAgo", "endDate": "today"}],
+            "dateRanges": [window],
             "dimensions": [{"name": "pagePath"}, {"name": "pageTitle"}],
             "metrics": [{"name": "screenPageViews"}],
             "orderBys": [{"metric": {"metricName": "screenPageViews"}, "desc": True}],
