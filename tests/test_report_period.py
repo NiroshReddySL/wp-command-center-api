@@ -177,11 +177,31 @@ class TestPrintedCover:
 
     def test_the_cover_fills_the_page(self) -> None:
         # Rather than a band of text at the top of an empty sheet.
-        assert "min-height:100vh;display:flex;flex-direction:column" in self._html()
+        assert ".cover-inner{max-width:none;min-height:100vh" in self._html()
+
+    def test_the_cover_holds_one_measure(self) -> None:
+        # Every rule and column on the cover shares a width. Letting the panel
+        # run to the full page while the lead wrapped at 640px produced three
+        # different measures, which reads as a broken layout.
+        html = self._html()
+        assert ".cover-inner{max-width:1000px}" in html
+        assert '<div class="cover-inner">' in html
+        # The rule spans the measure, the text keeps its reading width — the
+        # max-width must not sit on the bordered element itself.
+        assert ".cover-foot{margin-top:30px;padding-top:16px;border-top" in html
+        assert ".cover-foot p{" in html and "max-width:78ch" in html
 
     def test_findings_are_summarised_with_labels_not_colour_alone(self) -> None:
         html = self._html()
         assert "<b>2</b> critical" in html and "<b>5</b> high" in html
+
+    def test_severity_dots_are_legible_on_both_grounds(self) -> None:
+        # The cover is navy on screen and white on paper. One palette cannot
+        # serve both: medium (#0129AC) on the navy gradient was invisible.
+        html = self._html()
+        assert ".chip .medium{background:#A8C1FF" in html      # screen, on navy
+        assert ".chip .medium{background:#0129AC" in html      # print, on white
+        assert '<i class="critical"></i>' in html
 
     def test_a_clean_report_says_so_rather_than_showing_nothing(self) -> None:
         assert "No findings raised" in self._html(severity_counts={})

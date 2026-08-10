@@ -38,6 +38,11 @@ nav a:hover{background:#E1ECFF;color:#0129AC}
 .lead{font-size:1.02rem;color:#3c4658;max-width:760px;margin:.2em 0 1em}
 .cover{padding:56px 56px 48px;color:#fff;
  background:linear-gradient(140deg,#0129AC,#001a6e 70%,#00113f)}
+/* One measure for everything on the cover. Without it the panel stretched to
+   the full 1320px page while the lead paragraph wrapped at 640px and the
+   rules ran to three different widths — which reads as a broken layout
+   rather than a wide one. */
+.cover-inner{max-width:1000px}
 .brandbar{display:flex;align-items:center;gap:11px;padding-bottom:16px}
 .mark{width:27px;height:27px;border-radius:7px;background:#fff;color:#0129AC;flex:none;
  display:flex;align-items:center;justify-content:center;font-weight:900;font-size:.72rem;
@@ -57,15 +62,26 @@ h1{font-size:2.7rem;line-height:1.04;letter-spacing:-.03em;margin:.5em 0 .1em}
 /* Border AND background in the same colour: on screen it reads as a solid
    dot, and with "Background graphics" off — the print dialog's default — the
    ring still draws. The chip's label carries the severity either way, so
-   colour is never the only signal. */
+   colour is never the only signal.
+
+   Two palettes, because the panel is navy on screen and white on paper. The
+   print steps sit on the wrong side of the dark background: medium (#0129AC)
+   on the navy gradient was all but invisible. */
 .chip i{width:9px;height:9px;border-radius:50%;flex:none;border:2px solid;
  print-color-adjust:exact;-webkit-print-color-adjust:exact}
+.chip .critical{background:#FCA5A5;border-color:#FCA5A5}
+.chip .high{background:#FDBA74;border-color:#FDBA74}
+.chip .medium{background:#A8C1FF;border-color:#A8C1FF}
+.chip .opportunity{background:#6EE7B7;border-color:#6EE7B7}
 .chip b{font-weight:800}
 /* The screen has a sticky sidebar for this; print has nothing, so the cover
    carries the contents instead of the document having none. */
 .toc{display:none}
-.cover-foot{margin-top:30px;padding-top:16px;border-top:1px solid #ffffff26;
- font-size:.71rem;color:#a9b6e0;max-width:80ch;line-height:1.65}
+/* The rule spans the measure; the text keeps its own reading width. Putting
+   max-width on the bordered element itself stopped the rule two-thirds of the
+   way across, directly under a full-width one. */
+.cover-foot{margin-top:30px;padding-top:16px;border-top:1px solid #ffffff26}
+.cover-foot p{margin:0;font-size:.71rem;color:#a9b6e0;max-width:78ch;line-height:1.65}
 main{padding:40px 48px 72px;min-width:0}
 section{padding:26px 0 40px;border-bottom:1px solid #E2E8F0}
 section:last-child{border-bottom:0}
@@ -114,8 +130,12 @@ td:first-child{max-width:26rem;overflow-wrap:anywhere}
     them on it was a band of text at the top of an otherwise empty sheet.
     Print gets its own skin: dark ink on white, brand presence carried by
     rules and borders (which always print), filling the page properly. */
- .cover{background:#fff;color:#2E2E2E;padding:0;break-after:page;
-  min-height:100vh;display:flex;flex-direction:column}
+ .cover{background:#fff;color:#2E2E2E;padding:0;break-after:page}
+ .cover-inner{max-width:none;min-height:100vh;display:flex;flex-direction:column}
+ .chip .critical{background:#B91C1C;border-color:#B91C1C}
+ .chip .high{background:#C2410C;border-color:#C2410C}
+ .chip .medium{background:#0129AC;border-color:#0129AC}
+ .chip .opportunity{background:#047857;border-color:#047857}
  .brandbar{border-bottom:3px solid #0129AC;padding-bottom:13px}
  /* Outlined rather than filled: a filled mark with backgrounds off leaves
     white letters on white paper. A border always prints. */
@@ -276,18 +296,21 @@ def _on_date(iso: Any) -> str:
 
 def _chips(counts: dict) -> str:
     """Findings by severity. Each carries its label, so severity is never
-    conveyed by colour alone."""
+    conveyed by colour alone.
+
+    The dot takes a class rather than an inline colour, because the cover is
+    navy on screen and white on paper and one palette cannot serve both.
+    """
     present = [
-        (label, colour, counts.get(key, 0))
-        for key, (label, _bg, colour) in _SEVERITY_STYLE.items()
+        (key, label, counts.get(key, 0))
+        for key, (label, _bg, _fg) in _SEVERITY_STYLE.items()
         if counts.get(key)
     ]
     if not present:
         return '<div class="chips"><div class="chip">No findings raised</div></div>'
     return '<div class="chips">' + "".join(
-        f'<div class="chip"><i style="background:{colour};border-color:{colour}"></i>'
-        f"<b>{count}</b> {_e(label.lower())}</div>"
-        for label, colour, count in present
+        f'<div class="chip"><i class="{key}"></i><b>{count}</b> {_e(label.lower())}</div>'
+        for key, label, count in present
     ) + "</div>"
 
 
@@ -316,7 +339,7 @@ def _cover(data: dict, sections: list[dict]) -> str:
     generated = _on_date(data.get("generated_at"))
     scope = data.get("scope_note") or ""
 
-    return f"""<header class="cover">
+    return f"""<header class="cover"><div class="cover-inner">
 <div class="brandbar"><div class="mark">WP</div>
 <div class="eyebrow">WP Command Center · Site Report</div></div>
 <h1>{_e(data.get("site_name"))}</h1>
@@ -332,10 +355,10 @@ counted. Where something could not be measured, it says so instead of reporting 
 <div><b>{available} of {len(sources)}</b>Data sources available</div>
 </div>
 {_toc(sections)}
-<p class="cover-foot">{_e(scope)} Nothing in this document is estimated, inferred or
+<div class="cover-foot"><p>{_e(scope)} Nothing in this document is estimated, inferred or
 generated: every number is the result of a query, and the appendix lists exactly which
-sources answered and which did not.</p>
-</header>"""
+sources answered and which did not.</p></div>
+</div></header>"""
 
 
 def render_report(data: dict) -> str:
