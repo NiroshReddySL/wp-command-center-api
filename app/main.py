@@ -7,6 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.api.router import router
 from app.config import settings
 from app.database.engine import init_db
+from app.security.startup_checks import verify_settings
 from app.services.scheduler import scheduler, setup_scheduler
 
 logging.basicConfig(
@@ -17,6 +18,11 @@ logging.basicConfig(
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Before anything touches the database. A deployment that will not start
+    # is a problem you have on day one; one that starts with the published
+    # dev SECRET_KEY is a problem you have on the day someone else finds it.
+    verify_settings(settings)
+
     if settings.AUTO_CREATE_SCHEMA:
         await init_db()
 
@@ -35,13 +41,22 @@ app = FastAPI(
     description="AI-powered WordPress multi-site operations platform",
     version="0.1.0",
     lifespan=lifespan,
+    # The interactive docs enumerate every route, parameter and schema. That
+    # is a gift to a developer and a map for anyone probing the deployment,
+    # so production serves neither them nor the spec they are built from.
+    docs_url=None if settings.is_production else "/docs",
+    redoc_url=None if settings.is_production else "/redoc",
+    openapi_url=None if settings.is_production else "/openapi.json",
 )
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origins_list,
-    allow_credentials=True,
-    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    # Authentication is a bearer token from localStorage, never a cookie, so
+    # credentialed cross-origin requests are not something this API needs to
+    # permit — and allowing them widens what a hostile origin could attempt.
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["Authorization", "Content-Type"],
 )
 

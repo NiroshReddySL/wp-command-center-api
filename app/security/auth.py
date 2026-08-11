@@ -116,6 +116,18 @@ async def ensure_initial_admin(db: AsyncSession) -> None:
     if count > 0:
         return
 
+    if settings.is_production and not settings.ADMIN_PASSWORD:
+        # Generating one would write a live admin credential into the startup
+        # log, and production logs are shipped, indexed and retained. Better
+        # to have no account and say so than an account whose password is
+        # sitting in a log aggregator.
+        logger.error(
+            "No users exist and ADMIN_PASSWORD is unset. Refusing to generate one in "
+            "production, because it would be logged in plain text. Set ADMIN_PASSWORD "
+            "and restart to create the first account."
+        )
+        return
+
     email = settings.ADMIN_EMAIL or "admin@wpcc.local"
     password = settings.ADMIN_PASSWORD or secrets.token_urlsafe(12)
 
@@ -125,7 +137,7 @@ async def ensure_initial_admin(db: AsyncSession) -> None:
     if settings.ADMIN_PASSWORD:
         logger.info("Initial admin account created: %s", email)
     else:
-        # One-time generated credential — shown only in the startup log.
+        # Development only — see the production branch above.
         logger.warning(
             "Initial admin account created: %s / %s — log in and change this password",
             email, password,

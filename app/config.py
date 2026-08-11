@@ -6,6 +6,11 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
+    # Which safety rules apply. "production" turns the insecure-default checks
+    # in app/security/startup_checks.py from warnings into a refusal to boot:
+    # every default in this file is chosen so a developer can clone and run,
+    # and every one of those defaults is a vulnerability in front of real data.
+    ENVIRONMENT: str = "development"
     DATABASE_URL: str = "postgresql+asyncpg://wpcc:wpcc_secret@localhost:5432/wp_command_center"
     OPENAI_API_KEY: str = "sk-placeholder"
     GA_CLIENT_ID: str = ""
@@ -117,6 +122,10 @@ class Settings(BaseSettings):
     AUTO_CREATE_SCHEMA: bool = True
     # WordPress username the Application Passwords belong to.
     WP_API_USERNAME: str = "admin"
+
+    @property
+    def is_production(self) -> bool:
+        return self.ENVIRONMENT.strip().lower() in {"production", "prod"}
 
     @property
     def cors_origins_list(self) -> list[str]:
