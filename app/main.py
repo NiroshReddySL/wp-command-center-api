@@ -7,6 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.api.router import router
 from app.config import settings
 from app.database.engine import init_db
+from app.security.errors import REQUEST_ID_HEADER, install_error_handlers
 from app.security.startup_checks import verify_settings
 from app.services.scheduler import scheduler, setup_scheduler
 
@@ -49,6 +50,10 @@ app = FastAPI(
     openapi_url=None if settings.is_production else "/openapi.json",
 )
 
+# Request ids on every response, and a 500 body that carries a reference
+# instead of whatever text the failing library happened to produce.
+install_error_handlers(app)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origins_list,
@@ -57,7 +62,8 @@ app.add_middleware(
     # permit — and allowing them widens what a hostile origin could attempt.
     allow_credentials=False,
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-    allow_headers=["Authorization", "Content-Type"],
+    allow_headers=["Authorization", "Content-Type", REQUEST_ID_HEADER],
+    expose_headers=[REQUEST_ID_HEADER],
 )
 
 app.include_router(router, prefix="/api")

@@ -43,8 +43,10 @@ EXPOSE 8000
 
 # Hits /ready, which round-trips the database — a process that is up but
 # cannot reach Postgres is not ready to take traffic.
+# 127.0.0.1 rather than localhost: in some base images localhost resolves to
+# ::1 only, and the check then fails against a container that is serving fine.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-    CMD curl -fsS http://localhost:8000/ready || exit 1
+    CMD curl -fsS http://127.0.0.1:8000/ready || exit 1
 
 # Bounded graceful shutdown: SSE streams stay open indefinitely by design, so
 # without this a rolling deploy waits on them rather than draining.

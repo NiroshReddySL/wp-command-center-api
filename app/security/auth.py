@@ -10,8 +10,9 @@ import secrets
 from datetime import UTC, datetime, timedelta
 
 import bcrypt
+import jwt
 from fastapi import Depends, HTTPException, Query, Request
-from jose import JWTError, jwt
+from jwt import PyJWTError
 from pydantic import BaseModel
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -63,7 +64,7 @@ def verify_state_token(state: str) -> bool:
     try:
         payload = _decode_token(state)
         return payload.get("type") == "oauth_state"
-    except JWTError:
+    except PyJWTError:
         return False
 
 
@@ -88,7 +89,7 @@ async def require_user(
 
     try:
         payload = _decode_token(token)
-    except JWTError:
+    except PyJWTError:
         raise HTTPException(status_code=401, detail="Invalid or expired token") from None
 
     if payload.get("type") != "access" or not payload.get("sub"):

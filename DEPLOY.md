@@ -103,14 +103,40 @@ probing the deployment.
 
 | | |
 |---|---|
-| Auth | bcrypt passwords, JWT sessions, every data route behind `require_user`, admin routes behind `require_admin` |
+| Auth | bcrypt passwords, PyJWT HS256 sessions, every data route behind `require_user`, admin routes behind `require_admin`; expiry, `alg:none`, foreign-key and payload-tamper rejection covered by tests |
 | Secrets at rest | WordPress passwords and Google tokens Fernet-encrypted in the database |
+| Secrets in transit to the image | `.dockerignore` excludes `.env`; no secret has ever been committed (history scanned) |
 | SSRF | user-supplied URLs must resolve to public addresses; performance re-measure only accepts URLs the site already tracks |
-| Rate limiting | per-IP sliding window on login and job endpoints |
-| Container | non-root (uid 10001), read-only source tree, no compiler or test tooling in the runtime image, healthcheck on `/ready` |
-| Schema | owned by Alembic; `AUTO_CREATE_SCHEMA` is refused in production |
+| Rate limiting | per-IP sliding window on login and job endpoints; `TRUST_PROXY_HEADERS` on so limits key on the real client, not on nginx |
+| Errors | unhandled exceptions return a request id, never the exception text; the detail goes to the log |
+| Containers | non-root (uid 10001), read-only root filesystem, `cap_drop: ALL`, `no-new-privileges`, memory and CPU limits, no dev tooling or compiler in the runtime image |
+| Network | only the dashboard publishes a port, and only on loopback; the API and database are reachable solely inside the compose network |
+| Database | SCRAM-SHA-256 auth, 30s `statement_timeout`, 60s idle-in-transaction timeout, slow-query logging |
+| Schema | owned by Alembic in a one-shot service; `AUTO_CREATE_SCHEMA` is refused in production |
 | Shutdown | bounded graceful shutdown so SSE streams cannot stall a rolling deploy |
-| Browser | CSP, `nosniff`, `DENY` framing, referrer policy, no `server_tokens` |
+| Browser | CSP, `nosniff`, `DENY` framing, referrer and permissions policy, no `server_tokens` |
+| Dependencies | `pip-audit` and `npm audit` clean; both wired into CI on push and weekly |
+
+### Verified, not asserted
+
+Everything above was checked against running containers, not read off the
+config. Reproduce any of it:
+
+```bash
+# The production guard actually refuses insecure settings
+docker run --rm -e ENVIRONMENT=production <api-image> \
+  timeout 20 uvicorn app.main:app --port 8000     # expect: "Refusing to start"
+
+# No dev tooling, non-root, read-only rootfs
+docker run --rm <api-image> sh -c 'command -v pytest ruff gcc; id -u'
+docker exec <api-container> touch /app/x         # expect: Read-only file system
+
+# Security headers survive on the document, not just at server level
+curl -sI https://ops.yourdomain.com/ | grep -i content-security-policy
+```
+
+CI runs the first three on every push, so a regression fails the build rather
+than reaching a deploy.
 
 ## What is still yours to decide
 
@@ -127,6 +153,20 @@ on it.
 **Scaling past one API process.** The scheduler and the rate limiter are
 in-process singletons. Extra replicas need `ENABLE_SCHEDULER=false` (or every
 agent runs N times) and rate limiting moved to the edge.
+
+**Sessions cannot be revoked.** JWTs are stateless and valid until they expire
+(`JWT_EXPIRY_HOURS`, default 24). Logging out clears the browser's copy; it does
+not invalidate the token. If someone leaves or a token leaks, the options today
+are to delete the user (the token then fails the user lookup on the next
+request) or rotate `SECRET_KEY`, which signs everyone out at once. A revocation
+list would need somewhere shared to keep it — the same decision as moving rate
+limiting off-process.
+
+**Image update policy.** Base images are pinned to a major (`postgres:16-alpine`,
+`nginx:1.27-alpine`), not to a digest. A digest is stricter but goes stale, and
+a pinned digest carrying a known CVE is worse than a moving tag nobody watches.
+If you mirror into your own registry, pin digests there, where something is
+watching for updates.
 
 **Error tracking and metrics.** Logs go to Docker's json-file driver, capped at
 10 MB × 5 per service. There is no Sentry, no metrics endpoint, no alerting on

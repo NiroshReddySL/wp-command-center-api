@@ -20,11 +20,18 @@ dependencies = [
     "openai>=1.54.0,<3.0",
     "apscheduler>=3.10.4,<4.0",
     "httpx>=0.27.2,<1.0",
-    "python-jose[cryptography]>=3.3.0,<4.0",
+    # PyJWT rather than python-jose. jose pulls in `ecdsa`, which carries a
+    # timing-attack advisory (PYSEC-2026-1325) with NO fix version — an
+    # unfixable finding on every dependency scan, for an algorithm this app
+    # does not use. PyJWT has no such dependency and the same call signatures.
+    "pyjwt>=2.10.1,<3.0",
     "bcrypt>=4.2.0,<6.0",
     "python-multipart>=0.0.12,<1.0",
     "email-validator>=2.0.0,<3.0",
-    "cryptography>=43.0.0,<47.0",
+    # Floor is the version that fixes GHSA-537c-gmf6-5ccf and PYSEC-2026-3552
+    # through 3554; the previous <47 ceiling pinned it inside the vulnerable
+    # range. Encrypts every credential at rest, so this floor matters.
+    "cryptography>=50.0.0,<52.0",
 ]
 
 [project.optional-dependencies]

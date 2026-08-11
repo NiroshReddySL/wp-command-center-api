@@ -69,6 +69,67 @@ class TestTokens:
         assert not verify_state_token(create_access_token("user-123", "admin"))
 
 
+class TestTokenForgery:
+    """The classic JWT attacks, pinned against the library rather than assumed.
+
+    These matter more than usual here: the signing library was swapped from
+    python-jose to PyJWT (jose pulls in `ecdsa`, which carries a timing-attack
+    advisory with no fix version). A swap that quietly relaxed verification
+    would look exactly like a successful one — every existing test still
+    passes, because valid tokens keep working.
+    """
+
+    def test_an_expired_token_is_rejected(self) -> None:
+        from datetime import UTC, datetime, timedelta
+
+        import jwt
+
+        from app.config import settings
+        expired = jwt.encode(
+            {"sub": "u1", "role": "admin", "type": "access",
+             "exp": datetime.now(UTC) - timedelta(seconds=1)},
+            settings.SECRET_KEY, algorithm="HS256",
+        )
+        with pytest.raises(Exception):  # noqa: B017 - any rejection is correct
+            _decode_token(expired)
+
+    def test_a_token_signed_with_another_key_is_rejected(self) -> None:
+        import jwt
+
+        forged = jwt.encode(
+            {"sub": "u1", "role": "admin", "type": "access"},
+            "an-entirely-different-signing-key", algorithm="HS256",
+        )
+        with pytest.raises(Exception):  # noqa: B017
+            _decode_token(forged)
+
+    def test_the_none_algorithm_is_rejected(self) -> None:
+        # The original JWT vulnerability: strip the signature, set alg to
+        # "none", and an implementation that trusts the header waves it
+        # through as an admin.
+        import jwt
+
+        unsigned = jwt.encode(
+            {"sub": "u1", "role": "admin", "type": "access"}, key="", algorithm="none"
+        )
+        with pytest.raises(Exception):  # noqa: B017
+            _decode_token(unsigned)
+
+    def test_the_payload_cannot_be_edited_without_the_key(self) -> None:
+        # Privilege escalation by rewriting the role claim.
+        import base64
+        import json
+
+        header, payload, signature = create_access_token("u1", "member").split(".")
+        raw = json.loads(base64.urlsafe_b64decode(payload + "=="))
+        raw["role"] = "admin"
+        tampered = base64.urlsafe_b64encode(
+            json.dumps(raw).encode()
+        ).decode().rstrip("=")
+        with pytest.raises(Exception):  # noqa: B017
+            _decode_token(f"{header}.{tampered}.{signature}")
+
+
 class TestUrlGuard:
     def test_public_and_private_addresses(self) -> None:
         assert _is_public_address("93.184.216.34")

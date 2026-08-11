@@ -4,6 +4,15 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Dependency advisories appear without anyone committing, so the audit runs
+  # on a schedule too. A gate that only fires on pushes goes quiet exactly
+  # when a repository is stable — which is when an unpatched CVE sits longest.
+  schedule:
+    - cron: '0 6 * * 1'
+
+# The default token is read-only unless a job asks otherwise.
+permissions:
+  contents: read
 
 jobs:
   backend:
@@ -25,3 +34,64 @@ jobs:
 
       - name: Pytest
         run: python -m pytest tests/ -q
+
+  audit:
+    name: Dependency audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # Runtime dependencies only — the point is what ships, not what tests
+      # with. A dev-only advisory should not block a release.
+      - name: Install runtime dependencies
+        run: |
+          pip install --upgrade pip
+          pip install .
+
+      # Not --strict: that also fails when a package cannot be looked up, and
+      # this project's own distribution is not on PyPI — so --strict would
+      # make the gate permanently red for a reason unrelated to security, and
+      # a permanently red gate is one people learn to ignore. Without it,
+      # pip-audit still exits non-zero when it finds an advisory.
+      - name: pip-audit
+        run: |
+          pip install pip-audit
+          pip-audit --progress-spinner off
+
+  image:
+    name: Image builds and starts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build
+        run: docker build -t wpcc-api:ci .
+
+      # The Dockerfile is part of the deployable, so a change that breaks the
+      # image should fail here rather than during a deploy. This also proves
+      # the production config guard still refuses insecure settings — the one
+      # check whose failure mode is silent.
+      - name: Refuses to start with development defaults
+        run: |
+          set +e
+          output=$(docker run --rm -e ENVIRONMENT=production wpcc-api:ci \
+            timeout 20 uvicorn app.main:app --port 8000 2>&1)
+          echo "$output"
+          echo "$output" | grep -q "Refusing to start" \
+            || { echo "::error::production guard did not refuse insecure defaults"; exit 1; }
+
+      - name: Ships no development tooling
+        run: |
+          if docker run --rm wpcc-api:ci sh -c 'command -v pytest || command -v ruff || command -v gcc'; then
+            echo "::error::development tooling present in the runtime image"; exit 1
+          fi
+
+      - name: Runs as a non-root user
+        run: |
+          uid=$(docker run --rm wpcc-api:ci id -u)
+          [ "$uid" != "0" ] || { echo "::error::image runs as root"; exit 1; }
+          echo "runs as uid $uid"
