@@ -147,6 +147,15 @@ class ReviewItem(TimestampMixin, Base):
     reviewer_notes: Mapped[str | None] = mapped_column(Text, nullable=True)
     reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     site_id: Mapped[str] = mapped_column(String(36), ForeignKey("sites.id", ondelete="CASCADE"), nullable=False)
+    # Two-stage deletion. Retention moves old items here rather than deleting
+    # them, because a report someone sent to a client is not something to
+    # destroy on a count. NULL means active; a timestamp starts the 30-day
+    # window in which it can still be restored.
+    trashed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Exempt from retention entirely. The whole point of a lock is that an
+    # automatic rule cannot override it, so nothing but an explicit unlock
+    # removes this protection.
+    locked: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
 
     alert: Mapped["Alert | None"] = relationship("Alert", back_populates="review_items")
     site: Mapped["Site"] = relationship("Site")

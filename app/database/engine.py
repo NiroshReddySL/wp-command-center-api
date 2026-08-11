@@ -52,6 +52,11 @@ EXTRA_DDL: list[str] = [
             "ALTER TABLE content_posts ADD COLUMN IF NOT EXISTS content_type VARCHAR(10) NOT NULL DEFAULT 'post'",
             "ALTER TABLE content_posts ADD COLUMN IF NOT EXISTS wp_modified_at TIMESTAMPTZ",
             "ALTER TABLE content_posts ADD COLUMN IF NOT EXISTS ai_guidance JSONB",
+            # Two-stage deletion for stored reports (see 0013_report_retention).
+            "ALTER TABLE review_items ADD COLUMN IF NOT EXISTS trashed_at TIMESTAMPTZ",
+            "ALTER TABLE review_items ADD COLUMN IF NOT EXISTS locked BOOLEAN NOT NULL DEFAULT FALSE",
+            """CREATE INDEX IF NOT EXISTS ix_review_items_lifecycle
+               ON review_items (action_type, site_id, trashed_at, created_at DESC)""",
             # Agent job tables (idempotent — safe on every boot)
             """CREATE TABLE IF NOT EXISTS agent_jobs (
                 id              VARCHAR(36) PRIMARY KEY,

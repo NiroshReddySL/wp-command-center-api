@@ -177,6 +177,31 @@ async def run_weekly_reports() -> None:
     await _send_weekly_digest()
 
 
+async def purge_report_trash() -> None:
+    """Drop reports that have been in the trash longer than the window allows.
+
+    Not gated on an agent toggle: this is housekeeping on data the user has
+    already deleted once, not an agent producing findings. It is also the only
+    thing that ever removes a report without someone asking, which is why the
+    purge excludes locked items twice over — here by the query, and by the
+    fact that locking restores an item out of the trash in the first place.
+    """
+    from app.reports.builder import REPORT_ACTION_TYPE
+    from app.reports.retention import TRASH_TTL_DAYS, purge_expired
+
+    async with AsyncSessionLocal() as db:
+        try:
+            removed = await purge_expired(db, REPORT_ACTION_TYPE)
+            await db.commit()
+        except Exception as exc:
+            await db.rollback()
+            logger.warning("Scheduler: report trash purge failed: %s", exc)
+            return
+    logger.info(
+        "Scheduler: purged %d report(s) trashed over %d days ago", removed, TRASH_TTL_DAYS
+    )
+
+
 async def _send_weekly_digest() -> None:
     """Post a 'weekly reports ready' card to Teams if the digest pref is on."""
     from app.config import settings as app_config
@@ -262,9 +287,16 @@ def setup_scheduler() -> None:
         misfire_grace_time=3600,
         **common,
     )
+    scheduler.add_job(
+        purge_report_trash,
+        trigger=CronTrigger(hour=5, minute=30),   # after the nightly agents, before the day
+        id="report-trash-purge",
+        misfire_grace_time=3600,
+        **common,
+    )
 
     scheduler.start()
     logger.info(
         "Scheduler started: watchdog(6h), performance(2h), optimizer(3am), traffic(1am), "
-        "predictions(2am), flows(4am), reporter(Fri 6am)"
+        "predictions(2am), flows(4am), trash purge(5:30am), reporter(Fri 6am)"
     )
