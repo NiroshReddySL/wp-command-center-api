@@ -1,5 +1,5 @@
 """Traffic agent API — snapshots, trends, alerts, flush/re-run."""
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
 from fastapi import APIRouter, BackgroundTasks, Depends, Query
@@ -225,6 +225,113 @@ async def traffic_summary(
         })
 
     return result
+
+
+class MetricTotal(BaseModel):
+    value: float
+    previous: float | None
+    # None when the preceding period has no data at all. Zero would read as
+    # "flat", which is a measurement; this is the absence of one.
+    change_pct: float | None
+
+
+class TrafficTotals(BaseModel):
+    start: str
+    end: str
+    days: int
+    # Days in the window that actually have a snapshot. Traffic sync has gaps,
+    # and a 28-day total built from 19 days is not a 28-day total — the UI says
+    # so rather than letting the number imply completeness.
+    recorded_days: int
+    previous_start: str
+    previous_end: str
+    previous_recorded_days: int
+    metrics: dict[str, MetricTotal]
+    # "ga4" | "estimated" | "mixed" — an estimated figure and a measured one
+    # must not look alike.
+    source: str
+
+
+def _weighted_mean(pairs: list[tuple[float, int]]) -> float:
+    """Mean weighted by sessions.
+
+    A plain mean of daily rates weights a quiet Sunday the same as a busy
+    Tuesday, which is not the period's bounce rate — it is the average of
+    twenty-eight unrelated numbers.
+    """
+    total_weight = sum(w for _, w in pairs if w > 0)
+    if not total_weight:
+        return 0.0
+    return sum(v * w for v, w in pairs if w > 0) / total_weight
+
+
+def _totals_for(snaps: list[TrafficSnapshot]) -> dict[str, float]:
+    rates = [(s.bounce_rate or 0.0, s.sessions or 0) for s in snaps]
+    durations = [(s.avg_session_duration or 0.0, s.sessions or 0) for s in snaps]
+    return {
+        "pageviews": float(sum(s.pageviews or 0 for s in snaps)),
+        "sessions": float(sum(s.sessions or 0 for s in snaps)),
+        "users": float(sum(s.users or 0 for s in snaps)),
+        "bounce_rate": _weighted_mean(rates),
+        "avg_session_duration": _weighted_mean(durations),
+    }
+
+
+@router.get("/totals", response_model=TrafficTotals)
+async def traffic_totals(
+    site_id: str | None = None,
+    range: str = "28d",
+    start_date: str | None = None,
+    end_date: str | None = None,
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """Totals for the selected range, against the period immediately before it.
+
+    Exists so the summary tiles answer the same question as the chart beneath
+    them. They previously showed today's figures under a control set to "Last
+    28 days" — a filter that does not scope the numbers below it is worse than
+    no filter, because the reader has no way to tell.
+    """
+    from app.utils.date_ranges import previous_period
+
+    since, until = resolve_date_range(range, start_date, end_date)
+    prev_since, prev_until = previous_period(since, until)
+
+    async def load(start: str, end: str) -> list[TrafficSnapshot]:
+        query = select(TrafficSnapshot).where(
+            TrafficSnapshot.date >= start, TrafficSnapshot.date <= end
+        )
+        if site_id:
+            query = query.where(TrafficSnapshot.site_id == site_id)
+        return list((await db.execute(query)).scalars().all())
+
+    current, previous = await load(since, until), await load(prev_since, prev_until)
+
+    now_totals, prev_totals = _totals_for(current), _totals_for(previous)
+    had_previous = bool(previous)
+
+    metrics: dict[str, Any] = {}
+    for key, value in now_totals.items():
+        before = prev_totals[key] if had_previous else None
+        change, comparable = _change_pct(value, before)
+        metrics[key] = {
+            "value": round(value, 2),
+            "previous": round(before, 2) if before is not None else None,
+            "change_pct": round(change, 1) if comparable else None,
+        }
+
+    sources = {s.source for s in current}
+    return {
+        "start": since,
+        "end": until,
+        "days": (date.fromisoformat(until) - date.fromisoformat(since)).days + 1,
+        "recorded_days": len({s.date for s in current}),
+        "previous_start": prev_since,
+        "previous_end": prev_until,
+        "previous_recorded_days": len({s.date for s in previous}),
+        "metrics": metrics,
+        "source": sources.pop() if len(sources) == 1 else ("mixed" if sources else "none"),
+    }
 
 
 _TREND_METRICS = {
