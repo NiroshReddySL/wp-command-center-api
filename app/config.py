@@ -63,6 +63,13 @@ class Settings(BaseSettings):
     # discovering them all is. Unique URLs verified per run — internal first.
     LINK_CHECK_MAX_URLS: int = 500
     LINK_CHECK_CONCURRENCY: int = 16
+    # Share of the per-run budget reserved for links pointing off the site.
+    # Without a reserve, a site with more internal links than the whole budget
+    # never checks a single external one: the old code concatenated internal
+    # and external then sliced, so on a 1,294-internal-link site every external
+    # link went unverified forever. Whatever one class cannot use flows to the
+    # other, so the budget is never left unspent.
+    LINK_CHECK_EXTERNAL_SHARE: float = 0.4
     # Cap OpenAI recommendation calls per ContentScorer run — bounds cost and
     # runtime regardless of site size. Posts are prioritized worst-score-first
     # (then by traffic), so the neediest content is always served first; any

@@ -174,6 +174,33 @@ class Variant(TimestampMixin, Base):
     content_post: Mapped["ContentPost"] = relationship("ContentPost", back_populates="variants")
 
 
+class LinkCheck(Base):
+    """When each link was last verified, so coverage rotates across runs.
+
+    A run can only afford a few hundred HTTP checks, and without a memory of
+    what was already checked it takes the same alphabetically-first slice every
+    time — on a 2,097-link site that meant 76% of links were never verified
+    once, and the report said "0 broken links".
+
+    Keyed by a hash of the URL: link targets routinely exceed the ~2,700-byte
+    limit for a btree index entry, and a unique index is the point.
+    """
+
+    __tablename__ = "link_checks"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    site_id: Mapped[str] = mapped_column(String(36), ForeignKey("sites.id", ondelete="CASCADE"), nullable=False)
+    url_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    url: Mapped[str] = mapped_column(Text, nullable=False)
+    is_internal: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    # Last HTTP status; 0 means "could not connect". Kept so a run can report
+    # what it knows without re-fetching everything.
+    status: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    checked_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    __table_args__ = (UniqueConstraint("site_id", "url_hash", name="uq_link_check_site_url"),)
+
+
 class PerformanceSnapshot(Base):
     __tablename__ = "performance_snapshots"
 

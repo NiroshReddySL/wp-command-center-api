@@ -52,6 +52,20 @@ EXTRA_DDL: list[str] = [
             "ALTER TABLE content_posts ADD COLUMN IF NOT EXISTS content_type VARCHAR(10) NOT NULL DEFAULT 'post'",
             "ALTER TABLE content_posts ADD COLUMN IF NOT EXISTS wp_modified_at TIMESTAMPTZ",
             "ALTER TABLE content_posts ADD COLUMN IF NOT EXISTS ai_guidance JSONB",
+            # Link-check rotation (see 0014_link_check_rotation).
+            """CREATE TABLE IF NOT EXISTS link_checks (
+                id          VARCHAR(36) PRIMARY KEY,
+                site_id     VARCHAR(36) NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
+                url_hash    VARCHAR(64) NOT NULL,
+                url         TEXT NOT NULL,
+                is_internal BOOLEAN NOT NULL DEFAULT FALSE,
+                status      INTEGER NOT NULL DEFAULT 0,
+                checked_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )""",
+            """CREATE UNIQUE INDEX IF NOT EXISTS uq_link_check_site_url
+               ON link_checks (site_id, url_hash)""",
+            """CREATE INDEX IF NOT EXISTS ix_link_checks_rotation
+               ON link_checks (site_id, checked_at)""",
             # Two-stage deletion for stored reports (see 0013_report_retention).
             "ALTER TABLE review_items ADD COLUMN IF NOT EXISTS trashed_at TIMESTAMPTZ",
             "ALTER TABLE review_items ADD COLUMN IF NOT EXISTS locked BOOLEAN NOT NULL DEFAULT FALSE",

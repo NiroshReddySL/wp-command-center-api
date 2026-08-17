@@ -14,17 +14,21 @@ run, internal first. Coverage is logged so silent truncation can't
 masquerade as a clean bill.
 """
 import asyncio
+import hashlib
 import logging
+import uuid
+from datetime import UTC, datetime
 from html.parser import HTMLParser
 from urllib.parse import urljoin, urlparse
 
 import httpx
 from sqlalchemy import delete, select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from app.agents.base import BaseAgent
 from app.agents.wp_fetch import get_pages_cached, get_posts_cached
 from app.config import settings
-from app.database.models import Alert, Site
+from app.database.models import Alert, LinkCheck, Site
 
 logger = logging.getLogger(__name__)
 
@@ -132,6 +136,28 @@ async def _check_url(client: httpx.AsyncClient, url: str, retries: int = 2) -> i
     return status
 
 
+# Everything legal in a hostname, plus the port separator and IPv6 brackets.
+_HOST_ALLOWED = set("abcdefghijklmnopqrstuvwxyz0123456789-._:[]")
+
+
+def is_malformed_host(url: str) -> bool:
+    """True when the URL's host could never resolve for anyone.
+
+    The case this exists for is an `href` containing prose — someone pasting a
+    sentence into WordPress's link field, which yields
+    `http://A%20manual%20approach%20may%20work...` as a link on the live page.
+
+    Without this it is indistinguishable from an external host that happened
+    not to answer, and gets the benefit of the doubt reserved for third-party
+    flakiness: reported as a warning that might come back on its own. It never
+    will. It is a content defect on your own page, and it is certain.
+    """
+    host = urlparse(url).netloc.lower()
+    if not host:
+        return True
+    return any(c not in _HOST_ALLOWED for c in host)
+
+
 def _classify(status: int, is_internal: bool) -> str | None:
     """Map a status to 'critical' / 'warning' / None (not broken)."""
     if is_internal and status in _INTERNAL_BROKEN_STATUSES:
@@ -155,6 +181,53 @@ def _classify(status: int, is_internal: bool) -> str | None:
     return None
 
 
+def plan_link_batch(
+    internal: list[str],
+    external: list[str],
+    last_checked: dict[str, datetime],
+    *,
+    budget: int,
+    external_share: float = 0.4,
+) -> list[tuple[str, bool]]:
+    """Which links to verify this run, least-recently-checked first.
+
+    Two separate defects lived in the line this replaces —
+    `(internal_sorted + external_sorted)[:cap]`.
+
+    The first is starvation. Concatenating the classes before slicing means a
+    site with more internal links than the whole budget never checks a single
+    external one. On the install this was found on that was 1,294 internal
+    links against a budget of 500: every external link on the site was
+    unverified, permanently. So each class gets a guaranteed share, and
+    whatever one class cannot use flows to the other rather than being wasted.
+
+    The second is that a sorted slice is the *same* slice every run. Coverage
+    has to come from rotation, exactly as it does for the performance sweep:
+    least-recently-checked first, never-checked ahead of everything, so
+    repeated runs reach new links instead of re-verifying one alphabetical
+    window forever.
+    """
+    budget = max(0, budget)
+    far_past = datetime.min.replace(tzinfo=UTC)
+
+    def stalest(urls: list[str]) -> list[str]:
+        # Sorted by url as the tie-break so a run is deterministic when many
+        # links share a timestamp — which they do, since a run stamps them all.
+        return sorted(dict.fromkeys(urls), key=lambda u: (last_checked.get(u) or far_past, u))
+
+    ranked_internal, ranked_external = stalest(internal), stalest(external)
+
+    want_external = min(len(ranked_external), int(budget * external_share))
+    want_internal = min(len(ranked_internal), budget - want_external)
+    # Hand back anything the other class left on the table.
+    want_external = min(len(ranked_external), budget - want_internal)
+
+    return (
+        [(u, True) for u in ranked_internal[:want_internal]]
+        + [(u, False) for u in ranked_external[:want_external]]
+    )
+
+
 def _plan_reconcile(
     existing: set[str], broken: set[str], checked: set[str]
 ) -> tuple[set[str], set[str], set[str]]:
@@ -169,6 +242,42 @@ def _plan_reconcile(
 
 
 class LinkChecker(BaseAgent):
+    async def _record_checks(
+        self, site_id: str, outcomes: dict[str, tuple[int, bool]]
+    ) -> None:
+        """Stamp every link verified this run, so the next one moves on.
+
+        An upsert rather than delete-and-insert: a link that disappears from
+        the site keeps its row until the sweep below removes it, and a row that
+        survives keeps its identity.
+        """
+        if not outcomes:
+            return
+        now = datetime.now(UTC)
+        rows = [
+            {
+                "id": str(uuid.uuid4()),
+                "site_id": site_id,
+                "url_hash": hashlib.sha256(url.encode()).hexdigest(),
+                "url": url,
+                "is_internal": is_internal,
+                "status": status,
+                "checked_at": now,
+            }
+            for url, (status, is_internal) in outcomes.items()
+        ]
+        stmt = pg_insert(LinkCheck).values(rows)
+        await self.db.execute(
+            stmt.on_conflict_do_update(
+                index_elements=[LinkCheck.site_id, LinkCheck.url_hash],
+                set_={
+                    "status": stmt.excluded.status,
+                    "checked_at": stmt.excluded.checked_at,
+                    "is_internal": stmt.excluded.is_internal,
+                },
+            )
+        )
+
     async def run(self, site_id: str) -> list[Alert]:
         result = await self.db.execute(select(Site).where(Site.id == site_id))
         site = result.scalar_one_or_none()
@@ -205,23 +314,47 @@ class LinkChecker(BaseAgent):
         internal = {u: fo for u, fo in links_map.items() if urlparse(u).netloc == site_domain}
         external = {u: fo for u, fo in links_map.items() if u not in internal}
 
-        # Deterministic order, internal first, bounded per run
+        # When each link was last verified — the memory that makes the budget
+        # rotate instead of re-checking one alphabetical window forever.
+        seen_rows = (await self.db.execute(
+            select(LinkCheck.url, LinkCheck.checked_at).where(LinkCheck.site_id == site_id)
+        )).all()
+        last_checked = dict(seen_rows)
+
         cap = settings.LINK_CHECK_MAX_URLS
-        to_check: list[tuple[str, set[str], bool]] = (
-            [(u, internal[u], True) for u in sorted(internal)]
-            + [(u, external[u], False) for u in sorted(external)]
-        )[:cap]
+        planned = plan_link_batch(
+            list(internal), list(external), last_checked,
+            budget=cap, external_share=settings.LINK_CHECK_EXTERNAL_SHARE,
+        )
+        to_check: list[tuple[str, set[str], bool]] = [
+            (u, (internal if is_int else external)[u], is_int) for u, is_int in planned
+        ]
+        never = sum(1 for u in links_map if u not in last_checked)
         logger.info(
-            "LinkChecker %s: verifying %d/%d unique links (%d internal, %d external) from %d documents",
-            site_domain, len(to_check), len(links_map), len(internal), len(external), len(posts) + len(pages),
+            "LinkChecker %s: verifying %d/%d unique links (%d internal, %d external) "
+            "from %d documents — %d of %d links have never been checked",
+            site_domain, len(to_check), len(links_map),
+            sum(1 for _, i in planned if i), sum(1 for _, i in planned if not i),
+            len(posts) + len(pages), never, len(links_map),
         )
 
         broken: dict[str, tuple[int, list[str], bool, str]] = {}  # url -> (status, found_on, is_internal, severity)
+        outcomes: dict[str, tuple[int, bool]] = {}   # url -> (status, is_internal)
         semaphore = asyncio.Semaphore(settings.LINK_CHECK_CONCURRENCY)
 
         async def check(client: httpx.AsyncClient, url: str, found_on: set[str], is_internal: bool) -> None:
             async with semaphore:
+                if is_malformed_host(url):
+                    # No request to make — this host cannot exist. Skipping the
+                    # HTTP attempt also stops a page of prose being retried
+                    # three times before reaching the same conclusion.
+                    outcomes[url] = (0, is_internal)
+                    broken[url] = (0, sorted(found_on)[:10], is_internal, "critical")
+                    return
                 status = await _check_url(client, url)
+                # Recorded whatever the verdict — the rotation needs to know a
+                # link was looked at, not just that it was found wanting.
+                outcomes[url] = (status, is_internal)
                 severity = _classify(status, is_internal)
                 if severity is not None:
                     broken[url] = (status, sorted(found_on)[:10], is_internal, severity)
@@ -235,6 +368,8 @@ class LinkChecker(BaseAgent):
             ),
         ) as client:
             await asyncio.gather(*[check(client, u, fo, i) for u, fo, i in to_check])
+
+        await self._record_checks(site_id, outcomes)
 
         # ── Reconcile against existing alerts (keyed by URL) ─────────────────
         existing_r = await self.db.execute(
@@ -263,16 +398,31 @@ class LinkChecker(BaseAgent):
 
         def _fields(url: str) -> tuple[str, str, dict]:
             status_code, found_on, is_internal, _ = broken[url]
-            label = f"HTTP {status_code}" if status_code else "Connection failed / Timeout"
-            link_type = "Internal" if is_internal else "External"
-            title = f"{link_type} broken link ({label}): {url[:70]}"
-            description = f"Found on: {found_on[0] if found_on else 'unknown'}"
+            malformed = is_malformed_host(url)
+            where = found_on[0] if found_on else "unknown"
+
+            if malformed:
+                # Naming the cause, because "connection failed" sends someone
+                # to check a server when the fix is to edit the link text.
+                title = f"Malformed link on the page: {url[:70]}"
+                description = (
+                    f"The href is not a URL — its host is {urlparse(url).netloc[:60]!r}. "
+                    "This usually means text was pasted into the link field. "
+                    f"Edit the link on: {where}"
+                )
+            else:
+                label = f"HTTP {status_code}" if status_code else "Connection failed / Timeout"
+                link_type = "Internal" if is_internal else "External"
+                title = f"{link_type} broken link ({label}): {url[:70]}"
+                description = f"Found on: {where}"
+
             meta = {
                 "url": url,
                 "status_code": status_code,
                 "found_on": found_on,
                 "found_on_count": len(links_map.get(url, [])),
                 "is_internal": is_internal,
+                "malformed": malformed,
             }
             return title, description, meta
 
