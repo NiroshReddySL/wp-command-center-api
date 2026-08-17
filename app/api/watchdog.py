@@ -1,10 +1,15 @@
 import asyncio
+import csv
+import io
+import json
 import logging
 import re
+from collections.abc import Iterator
 from datetime import UTC, datetime
 from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -55,26 +60,26 @@ class AlertResponse(BaseModel):
     model_config = {"from_attributes": True}
 
 
-@router.get("/alerts", response_model=list[AlertResponse])
-async def list_alerts(
+def alert_query(
+    *,
     site_id: str | None = None,
     severity: str | None = None,
     agent: str | None = None,
     status: str | None = None,
     type: str | None = None,
     bucket: str | None = None,
-    limit: int = Query(200, ge=1, le=500),
-    offset: int = Query(0, ge=0),
-    db: AsyncSession = Depends(get_db),
-) -> list[dict[str, Any]]:
-    """Cross-agent alert listing — pass `agent` to scope to one agent (the
-    Watchdog page always does); omit it for a site's full alert history."""
+):
+    """The one definition of "which alerts match these filters".
+
+    Shared by the list and the CSV export. Two copies would drift, and the
+    drift is invisible: an export that quietly filters differently from the
+    table it was launched from produces a file someone acts on believing it
+    is what they were looking at.
+    """
     query = (
         select(Alert, Site.name.label("site_name"))
         .join(Site, Alert.site_id == Site.id)
         .order_by(Alert.created_at.desc())
-        .limit(limit)
-        .offset(offset)
     )
 
     if site_id:
@@ -98,8 +103,29 @@ async def list_alerts(
         # autoescape: `_` and `%` are LIKE wildcards, and this value comes
         # straight from the client — `type=_` matched every alert.
         query = query.where(Alert.type.contains(type, autoescape=True))
+    return query
 
-    result = await db.execute(query)
+
+@router.get("/alerts", response_model=list[AlertResponse])
+async def list_alerts(
+    site_id: str | None = None,
+    severity: str | None = None,
+    agent: str | None = None,
+    status: str | None = None,
+    type: str | None = None,
+    bucket: str | None = None,
+    limit: int = Query(200, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+    db: AsyncSession = Depends(get_db),
+) -> list[dict[str, Any]]:
+    """Cross-agent alert listing — pass `agent` to scope to one agent (the
+    Watchdog page always does); omit it for a site's full alert history."""
+    result = await db.execute(
+        alert_query(
+            site_id=site_id, severity=severity, agent=agent,
+            status=status, type=type, bucket=bucket,
+        ).limit(limit).offset(offset)
+    )
     rows = result.all()
 
     return [
@@ -119,6 +145,127 @@ async def list_alerts(
         }
         for a, site_name in rows
     ]
+
+
+# Columns worth a spreadsheet, per finding type. A single generic shape would
+# make the useful part — the URL, the version, the score — a blob of JSON in
+# one cell, which is the difference between a file someone can work from and
+# one they have to re-read by hand.
+_EXPORT_COLUMNS: dict[str, list[tuple[str, str]]] = {
+    "broken_link": [
+        ("url", "Broken URL"),
+        ("status_code", "HTTP status"),
+        ("malformed", "Malformed href"),
+        ("is_internal", "Internal"),
+        ("found_on", "Found on"),
+        ("found_on_count", "Pages affected"),
+    ],
+    "performance": [
+        ("page_url", "Page"),
+        ("speed_score", "PSI score"),
+        ("lcp_ms", "LCP (ms)"),
+        ("cls", "CLS"),
+        ("ttfb_ms", "TTFB (ms)"),
+        ("source", "Measured by"),
+    ],
+    "component": [
+        ("plugin_name", "Component"),
+        ("component_type", "Kind"),
+        ("installed_version", "Installed"),
+        ("latest_version", "Latest"),
+    ],
+}
+# Every export carries these, so a file is identifiable without its filename.
+_CORE_COLUMNS = [
+    ("severity", "Severity"),
+    ("type", "Type"),
+    ("site_name", "Site"),
+    ("title", "Finding"),
+    ("description", "Detail"),
+    ("status", "Status"),
+    ("created_at", "First seen"),
+]
+# A bounded file rather than a request that ties up a worker indefinitely.
+EXPORT_MAX_ROWS = 10_000
+
+
+def _cell(value: Any) -> str:
+    """One value, flattened for a spreadsheet cell."""
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return "yes" if value else "no"
+    if isinstance(value, list):
+        return " | ".join(str(v) for v in value)
+    if isinstance(value, dict):
+        return json.dumps(value, separators=(",", ":"))
+    if isinstance(value, datetime):
+        return value.isoformat(timespec="seconds")
+    return str(value)
+
+
+@router.get("/alerts/export.csv")
+async def export_alerts(
+    site_id: str | None = None,
+    severity: str | None = None,
+    agent: str | None = "watchdog",
+    status: str | None = None,
+    bucket: str | None = None,
+    db: AsyncSession = Depends(get_db),
+) -> StreamingResponse:
+    """The current view as CSV.
+
+    Takes the same filters as the list, because it is meant to be the list —
+    the table is paginated fifteen rows at a time, so exporting what is on
+    screen would hand over fifteen of four hundred findings and look complete.
+    """
+    rows = (await db.execute(
+        alert_query(
+            site_id=site_id, severity=severity, agent=agent,
+            status=status, bucket=bucket,
+        ).limit(EXPORT_MAX_ROWS)
+    )).all()
+
+    extra = _EXPORT_COLUMNS.get(bucket or "", [])
+    headers = [label for _, label in _CORE_COLUMNS] + [label for _, label in extra]
+
+    def generate() -> Iterator[str]:
+        buffer = io.StringIO()
+        writer = csv.writer(buffer)
+
+        def flush() -> str:
+            buffer.seek(0)
+            chunk = buffer.read()
+            buffer.seek(0)
+            buffer.truncate(0)
+            return chunk
+
+        writer.writerow(headers)
+        yield flush()
+
+        for alert, site_name in rows:
+            meta = alert.metadata_ or {}
+            record = {**{c.name: getattr(alert, c.name) for c in alert.__table__.columns},
+                      "site_name": site_name}
+            writer.writerow(
+                [_cell(record.get(key)) for key, _ in _CORE_COLUMNS]
+                + [_cell(meta.get(key)) for key, _ in extra]
+            )
+            yield flush()
+
+    stamp = datetime.now(UTC).strftime("%Y-%m-%d")
+    name = f"{bucket or 'watchdog'}-findings-{stamp}.csv"
+    return StreamingResponse(
+        generate(),
+        media_type="text/csv; charset=utf-8",
+        headers={
+            "Content-Disposition": f'attachment; filename="{name}"',
+            # So the UI can say "10,000 of 12,431" rather than implying the
+            # file is everything.
+            "X-Row-Count": str(len(rows)),
+            "X-Row-Limit": str(EXPORT_MAX_ROWS),
+        },
+    )
 
 
 class AlertSummary(BaseModel):
