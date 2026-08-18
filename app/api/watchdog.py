@@ -398,23 +398,38 @@ async def _run_watchdog(site_id: str | None, module: str | None) -> None:
                     failures.append(f"{name} on {site.name}: {exc}")
                     logger.warning("Watchdog %s failed for site %s: %s", name, site.id, exc)
 
-        await _record_run(db, ran=ran, failures=failures)
+        await _record_run(db, ran=ran, failures=failures, module=module)
         await db.commit()
 
 
-async def _record_run(db: AsyncSession, *, ran: int, failures: list[str]) -> None:
-    """Persist the last re-run outcome so a failed background run is visible.
+async def _record_run(
+    db: AsyncSession, *, ran: int, failures: list[str],
+    module: str | None = None, finished: bool = True,
+) -> None:
+    """Persist the re-run outcome so a failed background run is visible.
 
     Without this the only trace of a failure was a server-side log line, and
     the UI rendered an empty alert list as "Your sites are healthy."
+
+    `finished` matters because this is written twice: once when a run is
+    queued, to clear the previous banner, and once when it ends. Both used to
+    stamp `finished_at`, so a run that had not started yet was indistinguishable
+    from one that had completed — and with agents now startable individually,
+    "has mine finished" is a question someone actually asks.
     """
     from app.services.app_settings import set_json_setting
 
+    now = datetime.now(UTC).isoformat()
     await set_json_setting(
         db,
         _RUN_STATUS_KEY,
         {
-            "finished_at": datetime.now(UTC).isoformat(),
+            "finished_at": now if finished else None,
+            "started_at": None if finished else now,
+            "running": not finished,
+            # Which agent, so a banner can name what is in flight rather than
+            # saying "agents" when only one was asked for.
+            "module": module,
             "agents_succeeded": ran,
             # Bounded: this is a status banner, not a log sink.
             "failures": failures[:10],
@@ -448,7 +463,8 @@ async def flush_watchdog(
     graceful shutdown waits for request tasks — so a re-run in flight would
     wedge every restart behind "Waiting for background tasks to complete".
     """
-    await _record_run(db, ran=0, failures=[])  # clears the previous banner
+    # Marks a run as in flight; the background task overwrites it on exit.
+    await _record_run(db, ran=0, failures=[], module=req.module, finished=False)
     spawn(_run_watchdog(req.site_id, req.module), name="watchdog-rerun")
     return {"status": "running", "message": "Re-running watchdog in background"}
 
