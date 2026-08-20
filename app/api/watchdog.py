@@ -14,6 +14,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.agents.watchdog.link_checker import is_malformed_host
 from app.agents.watchdog.plugin_audit import (
     LATEST_MANUAL,
     LATEST_UNKNOWN,
@@ -24,6 +25,11 @@ from app.agents.watchdog.plugin_audit import (
 from app.database.engine import AsyncSessionLocal, get_db
 from app.database.models import Alert, PluginAudit, Site
 from app.security.rate_limit import job_limiter
+from app.services.link_repair import (
+    prose_from_url,
+    recheck_link,
+    suggest_replacements,
+)
 from app.services.performance_rescan import (
     known_urls,
     remeasure_one,
@@ -467,6 +473,86 @@ async def flush_watchdog(
     await _record_run(db, ran=0, failures=[], module=req.module, finished=False)
     spawn(_run_watchdog(req.site_id, req.module), name="watchdog-rerun")
     return {"status": "running", "message": "Re-running watchdog in background"}
+
+
+# ── Broken-link repair ────────────────────────────────────────────────────────
+#
+# Re-check verifies one link now, because the sweep rotates and would otherwise
+# take days to confirm a fix. Suggestions apply only to malformed hrefs, where
+# the prose someone pasted into the link field is the only clue to what they
+# meant — and they are offered, never applied.
+
+
+class LinkActionRequest(BaseModel):
+    site_id: str
+    url: str = Field(min_length=1, max_length=4096)
+
+
+async def _link_is_reported(db: AsyncSession, site_id: str, url: str) -> bool:
+    """Whether this site already has a finding naming this URL.
+
+    Both endpoints below take a URL from the client, and one of them makes the
+    server fetch it. Restricting them to URLs the site has already reported
+    keeps this from becoming a general-purpose fetcher — a public-address
+    check alone would still allow any host on the internet.
+    """
+    rows = (await db.execute(
+        select(Alert.metadata_).where(
+            Alert.site_id == site_id,
+            Alert.agent == "watchdog",
+            Alert.type == "broken_link",
+        )
+    )).scalars().all()
+    return any(isinstance(m, dict) and m.get("url") == url for m in rows)
+
+
+@router.post("/links/recheck", dependencies=[Depends(job_limiter)])
+async def recheck_broken_link(
+    payload: LinkActionRequest, db: AsyncSession = Depends(get_db)
+) -> dict[str, Any]:
+    """Verify one reported link now, and clear its finding if it works."""
+    site = await db.get(Site, payload.site_id)
+    if not site:
+        raise HTTPException(status_code=404, detail="Site not found")
+
+    url = payload.url.strip()
+    if not await _link_is_reported(db, payload.site_id, url):
+        raise HTTPException(
+            status_code=422, detail="That URL is not a reported link for this site"
+        )
+    try:
+        return await recheck_link(db, payload.site_id, site.url, url)
+    except Exception as exc:
+        logger.warning("Link re-check failed for %s: %s", url, exc)
+        raise HTTPException(status_code=502, detail=f"Could not check the link: {exc}") from exc
+
+
+@router.get("/links/suggestions")
+async def link_suggestions(
+    site_id: str,
+    url: str = Query(min_length=1, max_length=4096),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """Pages the prose in a malformed href probably meant.
+
+    Empty for a link to a real page that happens to fail: the destination is
+    known there, and proposing a replacement would be inventing an intention
+    nobody expressed.
+    """
+    if not await _link_is_reported(db, site_id, url):
+        raise HTTPException(
+            status_code=422, detail="That URL is not a reported link for this site"
+        )
+    suggestions = await suggest_replacements(db, site_id, url)
+    return {
+        "url": url,
+        "prose": prose_from_url(url) if is_malformed_host(url) else "",
+        "malformed": is_malformed_host(url),
+        "suggestions": [
+            {"url": s.url, "title": s.title, "score": s.score, "matched": s.matched}
+            for s in suggestions
+        ],
+    }
 
 
 # ── Performance re-measurement ────────────────────────────────────────────────
