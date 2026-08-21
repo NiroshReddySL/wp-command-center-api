@@ -17,7 +17,7 @@ socket wait is one no request can have.
 import asyncio
 import logging
 from dataclasses import asdict, dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import httpx
@@ -39,6 +39,15 @@ logger = logging.getLogger(__name__)
 
 STATUS_KEY = "watchdog.performance_rescan"
 
+# A run with no progress for this long is treated as stalled rather than
+# running. Nothing else can tell the difference: the worker writes its
+# `finished` record in a `finally`, which a killed process never reaches — so a
+# reload, a crash or a deploy mid-run leaves `running: true` forever, the UI
+# polling a number that will never move, and the "already running" guard
+# blocking every new run. A page takes about thirty seconds and progress is
+# saved after each, so three minutes of silence is unambiguous.
+STALE_AFTER = timedelta(minutes=3)
+
 # Scopes a caller may ask for. "reported" is the set the Performance tab
 # lists — re-running "the result" means exactly those pages. "all" is every
 # tracked page, bounded by PSI_RESCAN_MAX_PAGES.
@@ -58,6 +67,14 @@ class RescanProgress:
     finished_at: str | None = None
     site_id: str | None = None
     scope: str | None = None
+    # Heartbeat. Written on every save so a dead run is distinguishable from a
+    # slow one — see STALE_AFTER.
+    updated_at: str | None = None
+    # Set by the stop endpoint; the worker checks it between pages. A run of
+    # two hundred pages is nearly an hour, which is far too long to be
+    # committed to by one click.
+    stop_requested: bool = False
+    stopped: bool = False
     # Bounded: this drives a status banner, not an audit log.
     failures: list[str] = field(default_factory=list)
 
@@ -68,9 +85,58 @@ class RescanProgress:
 async def _save(progress: RescanProgress) -> None:
     from app.services.app_settings import set_json_setting
 
+    progress.updated_at = datetime.now(UTC).isoformat()
     async with AsyncSessionLocal() as db:
         await set_json_setting(db, STATUS_KEY, progress.as_dict())
         await db.commit()
+
+
+def is_stalled(record: dict[str, Any]) -> bool:
+    """Whether a record claiming to run has actually stopped reporting."""
+    if not record.get("running"):
+        return False
+    stamp = record.get("updated_at") or record.get("started_at")
+    if not stamp:
+        return True
+    try:
+        last = datetime.fromisoformat(stamp)
+    except ValueError:
+        return True
+    return datetime.now(UTC) - last > STALE_AFTER
+
+
+def is_active(record: dict[str, Any]) -> bool:
+    """Running *and* still reporting — the only state that blocks a new run."""
+    return bool(record.get("running")) and not is_stalled(record)
+
+
+async def request_stop() -> bool:
+    """Ask the worker to stop after the page it is on.
+
+    Also the way out of a stalled run: the record is marked stopped so the UI
+    reports it as over and the guard lets a new run start.
+    """
+    from app.services.app_settings import get_json_setting, set_json_setting
+
+    async with AsyncSessionLocal() as db:
+        record = await get_json_setting(db, STATUS_KEY)
+        if not record.get("running"):
+            return False
+        record["stop_requested"] = True
+        if is_stalled(record):
+            # Nothing is left to notice the request, so close it out here.
+            record.update(running=False, stopped=True,
+                          finished_at=datetime.now(UTC).isoformat())
+        await set_json_setting(db, STATUS_KEY, record)
+        await db.commit()
+        return True
+
+
+async def _stop_requested() -> bool:
+    from app.services.app_settings import get_json_setting
+
+    async with AsyncSessionLocal() as db:
+        return bool((await get_json_setting(db, STATUS_KEY)).get("stop_requested"))
 
 
 async def read_progress() -> dict[str, Any]:
@@ -270,6 +336,14 @@ async def run_bulk_remeasure(site_id: str, urls: list[str], scope: str) -> None:
     async def one(client: httpx.AsyncClient, url: str) -> None:
         outcome, message, resolved = "done", None, False
         async with semaphore:
+            # Checked here rather than only before the gather: a two-hundred
+            # page run is nearly an hour, so a stop has to take effect within
+            # one page, not at the end of the batch. Pages already in flight
+            # finish — abandoning a measurement mid-request would leave the
+            # page counted as neither done nor failed.
+            if progress.stop_requested or await _stop_requested():
+                progress.stop_requested = True
+                return
             m = await measure_page(client, url)
             async with AsyncSessionLocal() as db:
                 try:
@@ -298,11 +372,19 @@ async def run_bulk_remeasure(site_id: str, urls: list[str], scope: str) -> None:
         async with _client() as client:
             await asyncio.gather(*(one(client, u) for u in urls))
     finally:
-        # A crash mid-batch must not leave `running` true forever, which would
-        # block every later re-measure behind a job that is not there.
+        # Best effort only. A killed process never reaches this, which is why
+        # the record carries a heartbeat and `is_stalled` exists — without it
+        # a reload mid-run left `running: true` forever and the UI polled a
+        # number that would never move again.
         progress.running = False
+        progress.stopped = progress.stop_requested
         progress.finished_at = datetime.now(UTC).isoformat()
         await _save(progress)
+        if progress.stopped:
+            logger.info(
+                "Performance re-measure stopped on request after %d of %d pages",
+                progress.done + progress.failed, progress.total,
+            )
 
 
 def rescan_ceiling() -> int:

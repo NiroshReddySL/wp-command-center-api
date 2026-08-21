@@ -31,8 +31,11 @@ from app.services.link_repair import (
     suggest_replacements,
 )
 from app.services.performance_rescan import (
+    is_active,
+    is_stalled,
     known_urls,
     remeasure_one,
+    request_stop,
     rescan_ceiling,
     run_bulk_remeasure,
     select_scope,
@@ -626,11 +629,14 @@ async def rescan_performance(
     if not site:
         raise HTTPException(status_code=404, detail="Site not found")
 
+    # `is_active`, not `running`: a run whose process died still says running
+    # forever, and that used to block every later re-measure behind a job that
+    # was not there.
     current = await read_performance_progress()
-    if current.get("running"):
+    if is_active(current):
         raise HTTPException(
             status_code=409,
-            detail="A performance re-measure is already running. Wait for it to finish.",
+            detail="A performance re-measure is already running. Stop it or wait for it to finish.",
         )
 
     candidates = await select_scope(db, site, payload.scope)
@@ -660,8 +666,32 @@ async def rescan_performance(
 
 @router.get("/performance/rescan/status")
 async def performance_rescan_status() -> dict[str, Any]:
-    """Progress of the current or most recent performance re-measure."""
-    return await read_performance_progress()
+    """Progress of the current or most recent performance re-measure.
+
+    `stalled` is computed rather than stored: only the reader can tell that a
+    record claiming to run has stopped reporting, and the UI needs to say so
+    instead of showing a number that will never move again.
+    """
+    record = await read_performance_progress()
+    if record:
+        record["stalled"] = is_stalled(record)
+        record["active"] = is_active(record)
+    return record
+
+
+@router.post("/performance/rescan/stop")
+async def stop_performance_rescan() -> dict[str, Any]:
+    """Stop after the pages currently in flight.
+
+    Two hundred pages is close to an hour of PageSpeed calls — too long to be
+    committed to by one click. This is also the way out of a stalled run:
+    there is nothing left to notice the request, so the record is closed out
+    directly and a new run can start.
+    """
+    stopping = await request_stop()
+    if not stopping:
+        raise HTTPException(status_code=409, detail="No re-measure is running")
+    return {"status": "stopping"}
 
 
 # ── Component inventory ───────────────────────────────────────────────────────
